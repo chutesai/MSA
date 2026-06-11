@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fmha_sm100"
+version = "0.1.1"
+description = "MSA — MiniMax Sparse Attention: dense FlashAttention + sparse top-k indexer (csrc JIT) and CuTe-DSL sparse attention for NVIDIA SM100"
+readme = "README.md"
+requires-python = ">=3.10"
+# SPDX-License-Identifier: MIT
+license = { text = "MIT" }
+authors = [{ name = "MiniMax" }]
+dependencies = [
+    "torch",
+    "apache-tvm-ffi",
+    "jinja2",
+    "ninja",
+    "pybind11",
+    "cuda-python",
+    "nvidia-cutlass-dsl>=4.4.1",
+    "quack-kernels>=0.2.10",
+]
+
+[project.urls]
+
+# The Python package lives under python/. Both kernel stacks ship as package
+# data and work from both editable and wheel installs:
+#   * Dense csrc/ kernels are JIT-compiled at runtime (python/fmha_sm100/jit.py).
+#     The CUDA sources, Jinja templates, and vendored CUTLASS headers live inside
+#     the package directory so that JIT can locate them via __file__.
+#   * The CuTe-DSL sparse stack (python/fmha_sm100/cute/) is exposed through the
+#     importable `fmha_sm100.sparse` module (and lazily from the package root),
+#     which adds that directory to sys.path and re-exports the public sparse API.
+[tool.setuptools]
+package-dir = { "" = "python" }
+# The cute/ sparse sources are loaded via sys.path.insert at runtime by
+# fmha_sm100/sparse.py (not imported as a submodule), so they are shipped as
+# package data.
+packages = ["fmha_sm100"]
+
+[tool.setuptools.package-data]
+fmha_sm100 = [
+    "cute/**/*.py",
+    "cute/**/*.cu",
+    "cute/**/*.cuh",
+    "cute/**/*.h",
+    "cute/**/*.hpp",
+    "cute/**/*.md",
+    "cute/**/*.ini",
+    "cute/**/*.txt",
+    "cute/Makefile",
+    "csrc/**/*",
+    "cutlass/include/**/*",
+    "cutlass/tools/util/include/**/*",
+]

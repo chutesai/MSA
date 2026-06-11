@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Compiled / JIT artifacts
+*.so
+*.o
+*.cubin
+*.ptx
+
+# Caches
+.pytest_cache/
+.benchmarks/
+.cache/
+.ruff_cache/
+
+# Profiling
+*.ncu-rep
+*.nsys-rep
+log/
+profiles/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+tests/logs/

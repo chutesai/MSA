@@ -1,0 +1,14 @@
+# Runtime dependencies for fmha_sm100 (csrc JIT layer + CuTe-DSL sparse attention).
+# CUDA toolkit (nvcc) and an NVIDIA SM100 GPU are required at runtime.
+
+# Core
+torch
+apache-tvm-ffi
+jinja2
+ninja
+pybind11
+cuda-python
+
+# CuTe-DSL sparse attention backend
+nvidia-cutlass-dsl>=4.4.1
+quack-kernels>=0.2.10
