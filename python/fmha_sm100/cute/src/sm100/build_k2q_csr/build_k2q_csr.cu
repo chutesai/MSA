@@ -23,6 +23,7 @@
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -697,6 +698,10 @@ void run_build_k2q_csr(
     CHECK_INPUT(row_ptr);
     CHECK_INPUT(q_idx);
     TORCH_CHECK(blk_kv == 128, "build_k2q_csr only supports blk_kv == 128");
+    // The caller's current device may differ from the tensors' device inside
+    // a multi-GPU forward (NCCL / hybrid layers); every stream handle and
+    // launch below is only valid in the tensors' device context.
+    const at::cuda::CUDAGuard device_guard{q2k.device()};
     int H = (int)q2k.size(0);
     int S_Q = (int)q2k.size(1);
     int tr = (int)total_rows;
@@ -749,6 +754,7 @@ void run_build_k2q_csr_with_schedule(
     int64_t work_capacity,
     int64_t max_seqlen_q)
 {
+    const at::cuda::CUDAGuard device_guard{q2k.device()};
     CHECK_INPUT(q2k);
     CHECK_INPUT(cu_q);
     CHECK_INPUT(cu_k);

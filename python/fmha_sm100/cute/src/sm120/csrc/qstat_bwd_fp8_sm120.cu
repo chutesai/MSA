@@ -12,6 +12,7 @@
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -798,6 +799,7 @@ void qstat_dkdv_fp8(
     torch::Tensor k2q_q_indices, torch::Tensor row_batch, torch::Tensor row_kv_block,
     torch::Tensor dk_out, torch::Tensor dv_out,
     int64_t seq_len, int64_t block_tq, int64_t topk, int64_t nsplit, double scale) {
+  const at::cuda::CUDAGuard device_guard{q8.device()};
   const int heads_q = q8.size(1);
   const int heads_kv = k8.size(1);
   const int total_q = q8.size(0);
@@ -839,6 +841,7 @@ torch::Tensor qstat_dq_fp8(
     torch::Tensor outp, torch::Tensor lse, torch::Tensor unions,
     torch::Tensor counts, torch::Tensor selbits, torch::Tensor delta_out,
     int64_t batch, int64_t seq_len, int64_t block_t, double scale) {
+  const at::cuda::CUDAGuard device_guard{q.device()};
   TORCH_CHECK(q.dtype() == torch::kBFloat16 && q.is_contiguous());
   TORCH_CHECK(k8.dtype() == torch::kUInt8 && k8t.dtype() == torch::kUInt8);
   TORCH_CHECK(seq_len % 16 == 0, "dq fp8 requires seq_len % 16 == 0");
@@ -879,6 +882,7 @@ void qstat_quant_rows(
     torch::Tensor q, torch::Tensor dout, torch::Tensor vscale,
     torch::Tensor q8, torch::Tensor qsc, torch::Tensor do8, torch::Tensor dosc,
     int64_t g) {
+  const at::cuda::CUDAGuard device_guard{q.device()};
   const long rows = (long)q.size(0) * q.size(1);
   auto stream = at::cuda::getCurrentCUDAStream();
   qstat_quant_rows_kernel<<<rows, kDim, 0, stream>>>(

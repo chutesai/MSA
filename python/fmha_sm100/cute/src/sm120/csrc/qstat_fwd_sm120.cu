@@ -10,6 +10,7 @@
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
 
 #define DEVINL __device__ __forceinline__
@@ -307,6 +308,7 @@ torch::Tensor qstat_fwd_v3(
     torch::Tensor unions, torch::Tensor counts, torch::Tensor selbits,
     torch::Tensor lse_out, int64_t batch, int64_t seq_len, int64_t block_t,
     double scale) {
+  const at::cuda::CUDAGuard device_guard{q.device()};
   TORCH_CHECK(q.dtype() == torch::kBFloat16 && q.is_cuda() && q.is_contiguous());
   TORCH_CHECK(selbits.dtype() == torch::kInt64 || selbits.dtype() == torch::kUInt64);
   const int heads_q = q.size(1);
