@@ -58,16 +58,21 @@ def build_tile_block_union(
     seq_len: int,
     num_blocks: int,
     block_t: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    with_selbits: bool = False,
+):
     """Union of selected KV blocks per (kv_head, batch, query tile).
 
     Args:
         q2k: (H_kv, batch*seq_len, topk) int32, ascending valid block ids with
             -1 padding sorted to the end (the layout MSAAttentionLayer builds).
+        with_selbits: also return per-token membership bitmasks for the
+            hand-written CUDA forward (bit t of selbits[h, b, tile, u]: did
+            tile-local token t select union entry u).
     Returns:
         union: (H_kv, batch, ntiles, U_max) int32 ascending block ids, padded
             with num_blocks sentinel past each row's count.
         counts: (H_kv, batch, ntiles) int32 number of valid union entries.
+        selbits: (H_kv, batch, ntiles, U_max) int64, only when with_selbits.
     """
     head_kv, total_q, topk = q2k.shape
     if total_q != batch * seq_len:
@@ -99,7 +104,24 @@ def build_tile_block_union(
         order,
         torch.full_like(order, num_blocks),
     ).to(torch.int32)
-    return union.contiguous(), counts.contiguous()
+    if not with_selbits:
+        return union.contiguous(), counts.contiguous()
+    # Per-token membership over the same scatter indices: (token, block) pairs
+    # are unique within a tile (q2k lists unique blocks per token), so summing
+    # 1 << t equals bitwise OR.  The trash column swallows -1 padding and is
+    # zeroed so sentinel union entries gather empty masks.
+    weights = torch.ones(1, dtype=torch.int64, device=q2k.device) << (
+        torch.arange(block_t * topk, device=q2k.device, dtype=torch.int64) // topk
+    )
+    bits = torch.zeros(
+        (head_kv, batch, ntiles, num_blocks + 1),
+        dtype=torch.int64,
+        device=q2k.device,
+    )
+    bits.scatter_add_(-1, idx, weights.expand_as(idx))
+    bits[..., num_blocks] = 0
+    selbits = bits.gather(-1, union.long()).contiguous()
+    return union.contiguous(), counts.contiguous(), selbits
 
 
 def build_row_maps_fixed(
@@ -842,28 +864,46 @@ class _QstatSparseAttention(torch.autograd.Function):
         num_blocks = triton.cdiv(seq_len, blk_kv)
         head_kv = int(q2k.shape[0])
         block_t = _pick_block_t(head_q // head_kv)
-        union, counts = build_tile_block_union(q2k, batch, seq_len, num_blocks, block_t)
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
-        out, lse = qstat_forward(
-            q,
-            k,
-            v,
-            q2k,
-            union,
-            counts,
-            batch=batch,
-            seq_len=seq_len,
-            num_blocks=num_blocks,
-            block_t=block_t,
-            topk=topk,
-            blk_kv=blk_kv,
-            softmax_scale=softmax_scale,
-            kv_fp8=False,
-            k_scale=None,
-            v_scale=None,
-        )
+        impl = os.environ.get("FMHA_SM120_QSTAT_IMPL", "triton").strip().lower()
+        if impl not in {"triton", "cuda"}:
+            raise ValueError(f"FMHA_SM120_QSTAT_IMPL must be triton or cuda, got {impl!r}")
+        use_cuda = impl == "cuda" and blk_kv == 128 and dim == 128
+        if use_cuda:
+            union, counts, selbits = build_tile_block_union(
+                q2k, batch, seq_len, num_blocks, block_t, with_selbits=True
+            )
+            from src.sm120.qstat_cuda import qstat_forward_cuda
+
+            out, lse = qstat_forward_cuda(
+                q, k, v, union, counts, selbits,
+                batch=batch, seq_len=seq_len, block_t=block_t,
+                softmax_scale=softmax_scale,
+            )
+        else:
+            union, counts = build_tile_block_union(
+                q2k, batch, seq_len, num_blocks, block_t
+            )
+            out, lse = qstat_forward(
+                q,
+                k,
+                v,
+                q2k,
+                union,
+                counts,
+                batch=batch,
+                seq_len=seq_len,
+                num_blocks=num_blocks,
+                block_t=block_t,
+                topk=topk,
+                blk_kv=blk_kv,
+                softmax_scale=softmax_scale,
+                kv_fp8=False,
+                k_scale=None,
+                v_scale=None,
+            )
         ctx.save_for_backward(
             q, k, v, q2k, union, counts, k2q_row_ptr, k2q_q_indices, out, lse
         )
@@ -947,30 +987,50 @@ class _QstatSparseAttentionFp8(torch.autograd.Function):
         num_blocks = triton.cdiv(seq_len, blk_kv)
         head_kv = int(q2k.shape[0])
         block_t = _pick_block_t(head_q // head_kv)
-        union, counts = build_tile_block_union(q2k, batch, seq_len, num_blocks, block_t)
         q = q.contiguous()
         k_fp8_u8 = k_fp8_u8.contiguous()
         v_fp8_u8 = v_fp8_u8.contiguous()
         k_scale = k_scale.contiguous().float()
         v_scale = v_scale.contiguous().float()
-        out, lse = qstat_forward(
-            q,
-            k_fp8_u8,
-            v_fp8_u8,
-            q2k,
-            union,
-            counts,
-            batch=batch,
-            seq_len=seq_len,
-            num_blocks=num_blocks,
-            block_t=block_t,
-            topk=topk,
-            blk_kv=blk_kv,
-            softmax_scale=softmax_scale,
-            kv_fp8=True,
-            k_scale=k_scale,
-            v_scale=v_scale,
+        impl = os.environ.get("FMHA_SM120_QSTAT_IMPL", "triton").strip().lower()
+        if impl not in {"triton", "cuda"}:
+            raise ValueError(f"FMHA_SM120_QSTAT_IMPL must be triton or cuda, got {impl!r}")
+        use_cuda = (
+            impl == "cuda" and blk_kv == 128 and dim == 128 and seq_len % 16 == 0
         )
+        if use_cuda:
+            union, counts, selbits = build_tile_block_union(
+                q2k, batch, seq_len, num_blocks, block_t, with_selbits=True
+            )
+            from src.sm120.qstat_cuda import qstat_forward_fp8_cuda
+
+            out, lse = qstat_forward_fp8_cuda(
+                q, k_fp8_u8, v_fp8_u8, k_scale, v_scale, union, counts, selbits,
+                batch=batch, seq_len=seq_len, block_t=block_t,
+                softmax_scale=softmax_scale,
+            )
+        else:
+            union, counts = build_tile_block_union(
+                q2k, batch, seq_len, num_blocks, block_t
+            )
+            out, lse = qstat_forward(
+                q,
+                k_fp8_u8,
+                v_fp8_u8,
+                q2k,
+                union,
+                counts,
+                batch=batch,
+                seq_len=seq_len,
+                num_blocks=num_blocks,
+                block_t=block_t,
+                topk=topk,
+                blk_kv=blk_kv,
+                softmax_scale=softmax_scale,
+                kv_fp8=True,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
         ctx.save_for_backward(
             q,
             k_fp8_u8,
@@ -1009,10 +1069,47 @@ class _QstatSparseAttentionFp8(torch.autograd.Function):
             lse,
         ) = ctx.saved_tensors
         batch, seq_len, num_blocks, block_t, topk, blk_kv = ctx.geom
+        grads_impl = os.environ.get("FMHA_SM120_QSTAT_GRADS", "bf16").strip().lower()
+        if grads_impl not in {"bf16", "fp8"}:
+            raise ValueError(
+                f"FMHA_SM120_QSTAT_GRADS must be bf16 or fp8, got {grads_impl!r}"
+            )
+        if grads_impl == "fp8" and blk_kv == 128 and q.shape[-1] == 128 and seq_len % 16 == 0:
+            # EXPERIMENTAL full-e4m3 backward (gradient quantization; gate
+            # adoption on a loss-level A/B). ~0.999 cosine / 4-5% mean
+            # relative deviation vs the bf16 backward.
+            from src.sm120.qstat_cuda import qstat_backward_fp8_cuda
+
+            _, _, selbits = build_tile_block_union(
+                q2k, batch, seq_len, num_blocks, block_t, with_selbits=True
+            )
+            row_batch, row_kv_block = build_row_maps_fixed(
+                batch, num_blocks, q.device
+            )
+            dq, dk, dv = qstat_backward_fp8_cuda(
+                q, k_fp8_u8, v_fp8_u8, k_scale, v_scale,
+                dout.contiguous(), out, lse, union, counts, selbits,
+                k2q_row_ptr, k2q_q_indices, row_batch, row_kv_block,
+                batch=batch, seq_len=seq_len, block_t=block_t,
+                block_tq=block_t, topk=topk,
+                softmax_scale=ctx.softmax_scale,
+                kv_grad_dtype=ctx.kv_grad_dtype,
+            )
+            return (dq, dk, dv) + (None,) * 12
+        # Dequantize K/V once and run the bf16 backward kernels: the fp8
+        # variants dequantize in registers before every MMA, which costs
+        # ~10% of the train step. Numerics are unchanged — the same bf16
+        # values reach the same kernels either way.
+        k_deq = (
+            k_fp8_u8.view(torch.float8_e4m3fn).float() * k_scale.unsqueeze(-1)
+        ).to(ctx.q_dtype)
+        v_deq = (
+            v_fp8_u8.view(torch.float8_e4m3fn).float() * v_scale.unsqueeze(0)
+        ).to(ctx.q_dtype)
         dq, dk, dv = qstat_backward(
             q,
-            k_fp8_u8,
-            v_fp8_u8,
+            k_deq,
+            v_deq,
             q2k,
             union,
             counts,
@@ -1028,9 +1125,9 @@ class _QstatSparseAttentionFp8(torch.autograd.Function):
             topk=topk,
             blk_kv=blk_kv,
             softmax_scale=ctx.softmax_scale,
-            kv_fp8=True,
-            k_scale=k_scale,
-            v_scale=v_scale,
+            kv_fp8=False,
+            k_scale=None,
+            v_scale=None,
             kv_grad_dtype=ctx.kv_grad_dtype,
         )
         return (dq, dk, dv) + (None,) * 12

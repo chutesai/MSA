@@ -203,6 +203,8 @@ Environment variables:
 | `CUTE_DSL_ARCH` | unset | Overrides the CuTe-DSL target (e.g. `sm_120`); falls back to `FMHA_CUDA_ARCH`. |
 | `FMHA_SM120_TRITON_MODE` | `auto` | Prefill strategy: `auto`/`two_phase`/`chunked`/`recompute`/`row`/`qstat`. `auto` switches from two-phase to recompute when partial buffers would exceed `FMHA_SM120_MAX_PARTIAL_MIB` (default 1024). `qstat` selects the Q-stationary training kernels (below). |
 | `FMHA_SM120_BACKWARD` | `triton` | `triton` or `torch_ref` backward for the autograd path. |
+| `FMHA_SM120_QSTAT_GRADS` | `bf16` | **Experimental**: `fp8` runs the backward gradient MMAs in e4m3 (per-row dO/dS quantization, `src/sm120/csrc/qstat_bwd_fp8_sm120.cu`), ~12% faster train step on top of the CUDA forward. Gradient deviation vs the bf16 backward is ~0.999 cosine / 4-5% mean relative — gate adoption on a loss-level A/B. Requires `FMHA_SM120_QSTAT_IMPL=cuda` path constraints (D=128, blk 128, seq%16==0). |
+| `FMHA_SM120_QSTAT_IMPL` | `triton` | `cuda` swaps the qstat forwards for hand-written SM120 kernels (`src/sm120/csrc/qstat_fwd*.cu`: mma.sync + ldmatrix + cp.async pipeline). The bf16 forward is ~22% faster than Triton; the fp8 forward runs full-e4m3 MMA (S and PV) at 2 CTAs/SM, ~2.2x the Triton fp8 forward. Backward stays Triton. Compiled on first use. |
 | `FMHA_SM120_TRITON_STRICT` | `0` | `1` raises instead of falling back to the torch reference on unsupported cases. |
 | `FMHA_SM120_DECODE_SPLIT_PAGES` | `0` | Pages per split for decode split-KV. Unset, sparse decode runs unsplit; small-batch decode can gain ~30% from `2`-`4`. Dense decode over more than 32 pages always splits to bound kernel unrolling. |
 
