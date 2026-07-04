@@ -37,6 +37,7 @@ from src.common.softmax import SoftmaxSm100
 from src.common.named_barrier import NamedBarrierFwdSm100
 from src.common.mask import AttentionMask
 from src.common.seqlen_info import SeqlenInfoQK
+from src.common.arch import target_cute_arch
 # Shared raw PTX helpers and layout conversions used by the lean kernel.
 from src.common.paged_kv import PagedKVManager
 from src.common.tma_utils import (
@@ -150,7 +151,7 @@ class SparseAttentionForwardNvfp4KvSm100:
         #   S0/S1: [0:128], [128:256]
         #   O0/O1: [256:384], [384:512] for hdim_v=128
         #   P is bf16 and starts halfway into each S tile.
-        self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(target_cute_arch())
         self.tmem_s_offset = 0
         self.tmem_stage_stride = n_block_size
         self.tmem_o_stage_stride = self.head_dim

@@ -9,6 +9,7 @@ Doc is REPO/docs/fmha_sm100_api.md
 """
 
 import math
+import os
 from typing import Optional, Tuple, Union
 
 __all__ = [
@@ -104,7 +105,19 @@ _NUM_CTA = None
 def _get_num_cta(device):
     global _NUM_CTA
     if _NUM_CTA is None:
-        _NUM_CTA = torch.cuda.get_device_properties(device).multi_processor_count
+        props = torch.cuda.get_device_properties(device)
+        ctas = props.multi_processor_count
+        override = os.environ.get("FMHA_PLAN_MAX_CTAS")
+        if override:
+            ctas = min(ctas, int(override))
+        elif props.major == 12 and props.minor == 0:
+            # The plan kernel keeps one per-SM bucket in dynamic shared memory.
+            # RTX PRO 6000 Blackwell exposes 188 SMs but only 99 KiB opt-in
+            # shared memory per block, so the 256-bucket SM100 layout cannot
+            # launch there. Cap at the FMHA_PLAN_MAX_SMS default jit.py
+            # compiles for SM120.
+            ctas = min(ctas, 128)
+        _NUM_CTA = ctas
     return _NUM_CTA
 
 def _compute_pack_factor(max_qo_len, num_qo_heads, num_kv_heads):

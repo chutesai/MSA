@@ -41,6 +41,11 @@ The current public support contract is intentionally narrow:
 | FP4 indexer | SM100 block-score API, MXFP4/NVFP4, `D=128`, paged K, `blk_kv=128` |
 | Tests and benchmarks | CUDA required |
 
+The table above describes the SM100 CuTe-DSL kernels. On SM120-class devices
+(RTX PRO 6000 Blackwell) the same public entry points dispatch to Triton
+kernels in [`src/sm120/`](./src/sm120/) — see the top-level README's
+"SM120 support" section for scope and configuration.
+
 ## Installation
 
 Install a CUDA-enabled PyTorch build that matches your environment first. Then

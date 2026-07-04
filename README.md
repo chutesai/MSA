@@ -25,7 +25,8 @@ share one Python package:
 
 ## Requirements
 
-- **GPU**: NVIDIA SM100.
+- **GPU**: NVIDIA SM100 for the full CuTe-DSL stack; SM120 (RTX PRO 6000
+  Blackwell) runs through a Triton backend — see [SM120 support](#sm120-support).
 - **Toolchain**: CUDA Toolkit with `nvcc` on `PATH` (or `CUDA_HOME` / `CUDA_PATH` set).
 - **Python**: ≥ 3.10.
 - **OS**: Linux x86_64 (aarch64 untested; JIT builds may need small Makefile edits on WSL).
@@ -57,8 +58,9 @@ Check out the kernel on the Hugging Face Hub [here](https://huggingface.co/kerne
 ## Install
 
 ```bash
-# --recursive pulls the NVIDIA CUTLASS submodule (python/fmha_sm100/cutlass/),
-# whose headers are required for JIT/AOT compilation.
+# --recursive pulls the CUTLASS submodule (python/fmha_sm100/cutlass/), whose
+# headers are required for JIT/AOT compilation. The submodule tracks a CUTLASS
+# fork branch that adds SM120 build support on top of the pinned upstream base.
 git clone --recursive https://github.com/MiniMax-AI/MSA.git msa
 cd msa
 # If you cloned without --recursive:
@@ -146,6 +148,63 @@ python tests/regression/test_sparse_attn.py
 # CuTe-DSL forward-only sparse attention.
 cd python/fmha_sm100/cute
 python -m pytest test_sparse_atten.py -q
+
+# SM120 Triton backend (requires an SM120-class GPU).
+python -m pytest tests/sm120 -q
+```
+
+## SM120 support
+
+SM120 GPUs (RTX PRO 6000 Blackwell, compute capability 12.0) lack the
+tcgen05/TMEM instructions the SM100 CuTe-DSL kernels are built on. On these
+devices the public sparse attention API dispatches to a Triton backend in
+[`python/fmha_sm100/cute/src/sm120/`](python/fmha_sm100/cute/src/sm120/)
+instead:
+
+- **Prefill** (`sparse_atten_func`): BF16 Q/K/V forward and backward (custom
+  autograd), plus forward-only BF16 Q with FP8 E4M3 K/V.
+- **NVFP4 K/V prefill** (`sparse_atten_nvfp4_kv_func`): packed NVFP4 K/V with
+  128x4 scales; `sparse_atten_nvfp4_kv_train_func` adds a training path that
+  quantizes BF16 K/V on the fly and backpropagates to the logical tensors
+  (the on-the-fly quantizer requires a Transformer Engine install with NVFP4
+  support; the packed-input paths do not).
+- **Decode** (`sparse_decode_atten_func`, `SparseDecodePagedAttentionWrapper`):
+  paged FP8 decode.
+- A pure-PyTorch reference (`src/sm120/reference.py`) backs every path as a
+  correctness oracle and functional fallback.
+
+For training, `FMHA_SM120_TRITON_MODE=qstat` selects the Q-stationary kernels
+(`src/sm120/qstat.py`): single-pass online softmax with the GQA group folded
+into the MMA M dimension, and an atomics-free backward (deterministic
+gradients). Each query tile iterates the union of blocks its tokens selected,
+so throughput depends on selection overlap between neighboring tokens: on
+realistic sink+local patterns it is ~4-6x faster than the CSR modes (and the
+forward reaches roughly 60% of peak BF16 throughput on RTX PRO 6000), while
+on adversarial uncorrelated-random selections the CSR modes remain faster.
+Constraints: causal, fixed-length batches, no paged KV, D=128,
+`qhead_per_kv` in {1,2,4,8,16}. `sparse_attention_qstat_fp8` additionally
+takes pre-quantized E4M3 K/V with per-token/per-channel scales.
+
+The csrc JIT stack (dense FMHA, `sparse_topk_select`, plan kernel) compiles
+for SM120 with `FMHA_CUDA_ARCH=120`; the plan kernel's shared-memory layout is
+automatically sized down for the smaller opt-in shared memory per block.
+
+Environment variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FMHA_SM120_BACKEND` | `auto` | `auto`/`triton`/`torch_ref`/`off`. `auto` selects Triton on SM120-class devices and is a no-op elsewhere. |
+| `FMHA_CUDA_ARCH` | `100a` | Target arch for the csrc JIT and CUDA extensions, e.g. `120`. |
+| `CUTE_DSL_ARCH` | unset | Overrides the CuTe-DSL target (e.g. `sm_120`); falls back to `FMHA_CUDA_ARCH`. |
+| `FMHA_SM120_TRITON_MODE` | `auto` | Prefill strategy: `auto`/`two_phase`/`chunked`/`recompute`/`row`/`qstat`. `auto` switches from two-phase to recompute when partial buffers would exceed `FMHA_SM120_MAX_PARTIAL_MIB` (default 1024). `qstat` selects the Q-stationary training kernels (below). |
+| `FMHA_SM120_BACKWARD` | `triton` | `triton` or `torch_ref` backward for the autograd path. |
+| `FMHA_SM120_TRITON_STRICT` | `0` | `1` raises instead of falling back to the torch reference on unsupported cases. |
+| `FMHA_SM120_DECODE_SPLIT_PAGES` | `0` | Pages per split for decode split-KV. Unset, sparse decode runs unsplit; small-batch decode can gain ~30% from `2`-`4`. Dense decode over more than 32 pages always splits to bound kernel unrolling. |
+
+Run the full SM120 suite (correctness plus short benchmarks) with:
+
+```bash
+bash scripts/run_sm120_smoke.sh
 ```
 
 ## Benchmark
@@ -181,10 +240,12 @@ python/fmha_sm100/                  Python package
     include/                        Vendored FlashInfer / CUTLASS-derived / TRT-LLM headers
   cutlass/                          NVIDIA CUTLASS git submodule (include/ + tools/util/include/)
   cute/                             CuTe-DSL sparse attention (loaded via sys.path)
+    src/sm100/                      SM100 CuTe-DSL kernels
+    src/sm120/                      SM120 Triton backend + torch reference
 tests/                              Correctness tests
-  smoke/  integration/  regression/
-scripts/                            Warmup + cache-management helpers
-benchmarks/                         bench_sparse_attention_ops.py
+  smoke/  integration/  regression/  sm120/
+scripts/                            Warmup + cache-management + smoke helpers
+benchmarks/                         bench_sparse_attention_ops.py, bench_sm120_*.py
 ```
 
 ## Stacks

@@ -30,6 +30,7 @@ from quack import copy_utils, layout_utils
 
 from src.common import pipeline
 from src.common import blackwell_helpers as sm100_helpers
+from src.common.arch import target_cute_arch
 from src.common import mma_sm100_desc as sm100_desc
 from src.common.cute_dsl_utils import assume_tensor_aligned, torch2cute_dtype_map
 from src.common.named_barrier import NamedBarrierFwdSm100
@@ -172,7 +173,7 @@ class SparseDecodeAttentionForwardSm100:
         # S0/S1: [0:128], [128:256]
         # O0/O1: [256:384], [384:512] for head_dim_v=128
         # P (fp8) overlays the second half of each S tile via recast_ptr.
-        self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
+        self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(target_cute_arch())
         self.tmem_s_offset = 0
         self.tmem_stage_stride = self.n_block_size
         self.tmem_o_stage_stride = self.head_dim

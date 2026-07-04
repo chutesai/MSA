@@ -19,6 +19,7 @@ can simply do::
         SparseK2qCsrBuilderSm100,      # SM100 CSR builder (fused schedule)
         sparse_atten_func,             # block-sparse prefill
         sparse_atten_nvfp4_kv_func,    # block-sparse prefill, NVFP4 K/V
+        sparse_atten_nvfp4_kv_train_func,  # train path, NVFP4 K/V forward+backward
         sparse_decode_atten_func,      # block-sparse decode (functional)
         SparseDecodePagedAttentionWrapper,  # paged FP8 decode (plan/run)
     )
@@ -61,6 +62,7 @@ from interface import (  # noqa: E402
     SparseDecodePagedAttentionWrapper,
     sparse_atten_func,
     sparse_atten_nvfp4_kv_func,
+    sparse_atten_nvfp4_kv_train_func,
     sparse_decode_atten_func,
 )
 
@@ -90,6 +92,7 @@ __all__ = [
     # attention
     "sparse_atten_func",
     "sparse_atten_nvfp4_kv_func",
+    "sparse_atten_nvfp4_kv_train_func",
     "sparse_decode_atten_func",
     "SparseDecodePagedAttentionWrapper",
     # indexing / CSR

@@ -10,6 +10,8 @@ import os
 import torch
 from torch.utils.cpp_extension import load
 
+from src.common.arch import cuda_home, nvcc_arch_flag
+
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_THIS_DIR, "build_decode_schedule.cu")
 
@@ -18,10 +20,10 @@ _extra_cuda_cflags = [
     "-O3",
     "--use_fast_math",
     "-lineinfo",
-    "-arch=sm_100",
+    nvcc_arch_flag(),
     "--ptxas-options=-v",
     "--expt-relaxed-constexpr",
-    "-I/usr/local/cuda/include/cccl",
+    f"-I{cuda_home()}/include/cccl",
 ]
 
 _ext = None

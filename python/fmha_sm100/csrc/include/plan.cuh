@@ -33,8 +33,15 @@ constexpr float kSplitExtraOverhead = 150;
 // Plan kernel constants
 // ============================================================================
 
-constexpr int MAX_SMS = 256;
-constexpr int MAX_TASKS_PER_SM = 96;
+#ifndef FMHA_PLAN_MAX_SMS
+#define FMHA_PLAN_MAX_SMS 256
+#endif
+#ifndef FMHA_PLAN_MAX_TASKS_PER_SM
+#define FMHA_PLAN_MAX_TASKS_PER_SM 96
+#endif
+
+constexpr int MAX_SMS = FMHA_PLAN_MAX_SMS;
+constexpr int MAX_TASKS_PER_SM = FMHA_PLAN_MAX_TASKS_PER_SM;
 constexpr int MAX_UNSPLIT = 4096;
 constexpr int MAX_REBALANCE_ITERS = 1024;
 constexpr int MIN_ITERS_PER_SPLIT = 4;

@@ -1,3 +1,4 @@
 [submodule "python/fmha_sm100/cutlass"]
 	path = python/fmha_sm100/cutlass
-	url = https://github.com/NVIDIA/cutlass.git
+	url = https://github.com/chutesai/cutlass.git
+	branch = msa-sm120

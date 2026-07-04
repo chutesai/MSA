@@ -54,6 +54,24 @@ _SUPPORTED_FWD_MMA_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_DECODE_QHEAD_PER_KV = 16
 
 
+def _sm120_backend(q: torch.Tensor) -> Optional[str]:
+    """Backend for SM120-class devices: "triton", "torch_ref", or None (SM100 path)."""
+    backend = os.environ.get("FMHA_SM120_BACKEND", "auto").strip().lower()
+    if backend == "off":
+        return None
+    if backend not in {"auto", "triton", "torch_ref"}:
+        raise ValueError(
+            "FMHA_SM120_BACKEND must be one of auto/triton/torch_ref/off, "
+            f"got {backend!r}"
+        )
+    if not q.is_cuda:
+        return None
+    major, _ = torch.cuda.get_device_capability(q.device)
+    if major < 12:
+        return None
+    return "triton" if backend == "auto" else backend
+
+
 def _normalize_partial_dtype(partial_dtype: torch.dtype) -> torch.dtype:
     supported = {torch.float32, torch.bfloat16, torch.float16, torch.float8_e4m3fn}
     if partial_dtype not in supported:
@@ -622,6 +640,7 @@ def sparse_atten_func(
     usable_SM_count: int = -1,
     qk_dtype: Optional[torch.dtype] = None,
     pv_dtype: Optional[torch.dtype] = None,
+    q2k_indices: Optional[torch.Tensor] = None,
 ):
     """Run SM100 CSR block-sparse varlen attention.
 
@@ -691,6 +710,10 @@ def sparse_atten_func(
     pv_dtype : torch.dtype, optional
         Compile-time MMA operand dtype for PV.  Defaults to V storage dtype,
         except supported FP8 K/V cache staging modes.
+    q2k_indices : torch.Tensor, optional
+        Original query-to-key block indices with shape
+        ``[Hkv, total_q, topK]``.  This is optional for the SM100 CSR path, but
+        lets the SM120 backend avoid reconstructing q2k from CSR every call.
 
     Returns
     -------
@@ -733,6 +756,18 @@ def sparse_atten_func(
         cu_seqlens_k,
         seqused_k,
     )
+    if q2k_indices is not None:
+        if q2k_indices.device != q.device:
+            raise ValueError("q2k_indices must be on the same device as q")
+        if q2k_indices.dtype != torch.int32:
+            raise TypeError("q2k_indices must be torch.int32")
+        if q2k_indices.shape != (head_kv, q.shape[0], int(topK)):
+            raise ValueError(
+                "q2k_indices must have shape "
+                f"({head_kv}, {q.shape[0]}, {int(topK)}), got {tuple(q2k_indices.shape)}"
+            )
+        if not q2k_indices.is_contiguous():
+            q2k_indices = q2k_indices.contiguous()
     max_seqlen_q = int(max_seqlen_q)
     max_seqlen_k = int(max_seqlen_k)
 
@@ -762,6 +797,7 @@ def sparse_atten_func(
         int(max_seqlen_k),
         qk_dtype,
         pv_dtype,
+        q2k_indices,
     )
 
 
@@ -777,6 +813,7 @@ def sparse_atten_nvfp4_kv_func(
     k2q_q_indices: torch.Tensor,
     topK: int,
     *,
+    q2k_indices: Optional[torch.Tensor] = None,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
@@ -891,6 +928,33 @@ def sparse_atten_nvfp4_kv_func(
         cu_seqlens_k,
         seqused_k,
     )
+    sm120_backend = _sm120_backend(q)
+    if sm120_backend == "triton" and not return_temperature_lse:
+        if partial_dtype == torch.float8_e4m3fn:
+            raise NotImplementedError("SM120 NVFP4 backend does not emulate FP8 partial quantization")
+        from src.sm120.atten_triton import sparse_attention_nvfp4_kv_triton
+
+        return sparse_attention_nvfp4_kv_triton(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            k_scale_128x4.contiguous(),
+            v_scale_128x4.contiguous(),
+            None if k_global_scale is None else k_global_scale.contiguous(),
+            None if v_global_scale is None else v_global_scale.contiguous(),
+            k2q_row_ptr.contiguous(),
+            k2q_q_indices.contiguous(),
+            None if q2k_indices is None else q2k_indices.contiguous(),
+            topk=int(topK),
+            blk_kv=int(blk_kv),
+            causal=bool(causal),
+            softmax_scale=float(softmax_scale),
+            return_softmax_lse=bool(return_softmax_lse),
+            cu_seqlens_q=cu_seqlens_q.contiguous(),
+            cu_seqlens_k=cu_seqlens_k.contiguous(),
+            page_table=None if page_table is None else page_table.contiguous(),
+            seqused_k=None if seqused_k is None else seqused_k.contiguous(),
+        )
     total_q, head_q, dim = q.shape
     max_num_kv_blocks = _csr_row_capacity(k2q_row_ptr)
     temperature_lse_fast_path = (
@@ -991,6 +1055,93 @@ def sparse_atten_nvfp4_kv_func(
     return O_out
 
 
+def sparse_atten_nvfp4_kv_train_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k2q_row_ptr: torch.Tensor,
+    k2q_q_indices: torch.Tensor,
+    topK: int,
+    *,
+    q2k_indices: Optional[torch.Tensor] = None,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    blk_kv: int = 128,
+    causal: bool = False,
+    softmax_scale: Optional[float] = None,
+    partial_dtype: torch.dtype = torch.bfloat16,
+    return_softmax_lse: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    schedule: Optional[SparseAttentionSchedule] = None,
+):
+    """Train-time MSA sparse attention with native packed NVFP4 K/V.
+
+    The forward quantizes logical BF16/FP16 K/V into packed NVFP4 and calls the
+    SM120 packed-K/V sparse attention path.  The custom backward also consumes
+    packed NVFP4 K/V directly and returns gradients to the logical K/V tensors
+    through the quantizer boundary.
+    """
+
+    if return_softmax_lse:
+        raise NotImplementedError("sparse_atten_nvfp4_kv_train_func returns only the attention output")
+    if seqused_k is not None:
+        raise NotImplementedError("SM120 NVFP4 training path currently requires cu_seqlens_k effective lengths")
+    if partial_dtype != torch.bfloat16:
+        raise NotImplementedError("SM120 NVFP4 training path currently supports BF16 partial dtype only")
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** -0.5
+    if cu_seqlens_q is None or cu_seqlens_k is None:
+        raise ValueError("sparse_atten_nvfp4_kv_train_func requires cu_seqlens_q and cu_seqlens_k")
+    _validate_csr_varlen_inputs(
+        q,
+        k,
+        v,
+        k2q_row_ptr,
+        k2q_q_indices,
+        topK,
+        blk_kv,
+        page_table,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_k,
+    )
+    if q.dtype != torch.bfloat16:
+        raise NotImplementedError("SM120 NVFP4 training path currently supports BF16 Q only")
+    if k.dtype not in (torch.bfloat16, torch.float16) or v.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("logical K/V must be BF16 or FP16 before NVFP4 quantization")
+    if _sm120_backend(q) != "triton":
+        raise NotImplementedError("native NVFP4 K/V training is implemented for the SM120 Triton backend only")
+
+    from quantize import quantize_kv_bf16_to_nvfp4_128x4
+    from src.sm120.atten_triton import sparse_attention_nvfp4_kv_triton_autograd
+
+    k_q, v_q = quantize_kv_bf16_to_nvfp4_128x4(k.contiguous(), v.contiguous())
+    return sparse_attention_nvfp4_kv_triton_autograd(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        k_q.data,
+        v_q.data,
+        k_q.scale_128x4,
+        v_q.scale_128x4,
+        k_q.global_scale,
+        v_q.global_scale,
+        k2q_row_ptr.contiguous(),
+        k2q_q_indices.contiguous(),
+        q2k_indices=None if q2k_indices is None else q2k_indices.contiguous(),
+        topk=int(topK),
+        blk_kv=int(blk_kv),
+        causal=bool(causal),
+        softmax_scale=float(softmax_scale),
+        cu_seqlens_q=cu_seqlens_q.contiguous(),
+        cu_seqlens_k=cu_seqlens_k.contiguous(),
+        page_table=None if page_table is None else page_table.contiguous(),
+    )
+
+
 def sparse_decode_atten_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1067,6 +1218,45 @@ def sparse_decode_atten_func(
         blk_kv=blk_kv,
         causal=causal,
     )
+    sm120_backend = _sm120_backend(q)
+    if sm120_backend is not None:
+        if sm120_backend == "triton":
+            try:
+                from src.sm120.atten_triton import sparse_decode_paged_fp8_triton
+
+                return sparse_decode_paged_fp8_triton(
+                    q,
+                    k,
+                    v,
+                    q2k_indices,
+                    page_table=page_table,
+                    seqused_k=seqused_k,
+                    seqlen_q=seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    blk_kv=blk_kv,
+                    causal=causal,
+                    softmax_scale=softmax_scale,
+                    return_softmax_lse=return_softmax_lse,
+                )
+            except NotImplementedError:
+                if os.environ.get("FMHA_SM120_TRITON_STRICT", "0") == "1":
+                    raise
+        from src.sm120.reference import sparse_decode_paged_fp8_torch
+
+        return sparse_decode_paged_fp8_torch(
+            q,
+            k,
+            v,
+            q2k_indices,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            seqlen_q=seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            blk_kv=blk_kv,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            return_softmax_lse=return_softmax_lse,
+        )
     head_q = int(q.shape[1])
     head_dim = int(q.shape[2])
     if schedule is None:
@@ -1385,6 +1575,29 @@ class SparseDecodePagedAttentionWrapper:
 
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** -0.5
+        if _sm120_backend(q) is not None:
+            result = sparse_decode_atten_func(
+                q, k, v, None,
+                page_table=self.page_table, seqused_k=self.seqused_k,
+                seqlen_q=self.seqlen_q, max_seqlen_k=self.max_seqlen_k,
+                blk_kv=self.blk_kv, causal=self.causal,
+                softmax_scale=softmax_scale, return_softmax_lse=return_softmax_lse,
+                schedule=self.decode_schedule,
+                O_partial=self.O_partial, LSE_partial=self.LSE_partial,
+            )
+            if return_softmax_lse:
+                result_out, result_lse = result
+                if out is not None:
+                    out.copy_(result_out)
+                    result_out = out
+                if lse is not None:
+                    lse.copy_(result_lse)
+                    result_lse = lse
+                return result_out, result_lse
+            if out is not None:
+                out.copy_(result)
+                return out
+            return result
         if out is None:
             out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
         if lse is None:
@@ -1449,10 +1662,112 @@ def _sparse_atten_csr_varlen_forward(
     max_seqlen_k: int,
     qk_dtype: torch.dtype,
     pv_dtype: torch.dtype,
+    q2k_indices: Optional[torch.Tensor] = None,
 ):
     total_q, head_q, dim = q.shape
     if head_q % head_kv != 0:
         raise ValueError("q.shape[1] must be divisible by head_kv")
+    sm120_backend = _sm120_backend(q)
+    if sm120_backend is not None:
+        sm120_qsplit_indices = (
+            schedule.qsplit_indices
+            if schedule is not None and schedule.qsplit_indices is not None
+            else None
+        )
+        sm120_bf16_qkv = q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16
+        sm120_fp8_kv_cache = (
+            q.dtype == torch.bfloat16
+            and k.dtype == torch.float8_e4m3fn
+            and v.dtype == torch.float8_e4m3fn
+        )
+        if not (sm120_bf16_qkv or sm120_fp8_kv_cache):
+            raise NotImplementedError(
+                "SM120 backend supports BF16 Q/K/V or BF16 Q with FP8 E4M3 K/V "
+                "here; use sparse_atten_nvfp4_kv_func for packed NVFP4 K/V"
+            )
+        if partial_dtype == torch.float8_e4m3fn:
+            raise NotImplementedError(
+                "SM120 backend does not emulate FP8 partial quantization"
+            )
+        needs_autograd = torch.is_grad_enabled() and (
+            q.requires_grad or k.requires_grad or v.requires_grad
+        )
+        if sm120_backend == "triton" and not return_temperature_lse:
+            if needs_autograd and sm120_fp8_kv_cache:
+                raise NotImplementedError("SM120 FP8 K/V cache path is forward-only")
+            backward_impl = os.environ.get("FMHA_SM120_BACKWARD", "triton").strip().lower()
+            if backward_impl not in {"triton", "torch_ref"}:
+                raise ValueError(
+                    f"FMHA_SM120_BACKWARD must be triton or torch_ref, got {backward_impl!r}"
+                )
+            if needs_autograd and not return_softmax_lse and backward_impl == "triton":
+                from src.sm120.atten_triton import sparse_attention_csr_varlen_triton_autograd
+
+                return sparse_attention_csr_varlen_triton_autograd(
+                    q,
+                    k,
+                    v,
+                    k2q_row_ptr,
+                    k2q_q_indices,
+                    q2k_indices=q2k_indices,
+                    k2q_qsplit_indices=sm120_qsplit_indices,
+                    topk=topK,
+                    blk_kv=blk_kv,
+                    causal=causal,
+                    softmax_scale=softmax_scale,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    page_table=page_table,
+                )
+            if not needs_autograd:
+                from src.sm120.atten_triton import sparse_attention_csr_varlen_triton
+
+                try:
+                    return sparse_attention_csr_varlen_triton(
+                        q,
+                        k,
+                        v,
+                        k2q_row_ptr,
+                        k2q_q_indices,
+                        q2k_indices=q2k_indices,
+                        k2q_qsplit_indices=sm120_qsplit_indices,
+                        topk=topK,
+                        blk_kv=blk_kv,
+                        causal=causal,
+                        softmax_scale=softmax_scale,
+                        return_softmax_lse=return_softmax_lse,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=cu_seqlens_k,
+                        page_table=page_table,
+                        seqused_k=seqused_k,
+                    )
+                except NotImplementedError:
+                    if os.environ.get("FMHA_SM120_TRITON_STRICT", "0") == "1":
+                        raise
+            # Autograd that also returns LSE (or FMHA_SM120_BACKWARD=torch_ref)
+            # falls through to the differentiable torch reference: the custom
+            # Triton backward has no LSE gradient contract.
+        from src.sm120.reference import sparse_attention_csr_varlen_torch
+
+        return sparse_attention_csr_varlen_torch(
+            q,
+            k,
+            v,
+            k2q_row_ptr,
+            k2q_q_indices,
+            q2k_indices=q2k_indices,
+            topk=topK,
+            blk_kv=blk_kv,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            lse_temperature_scale=lse_temperature_scale,
+            return_temperature_lse=return_temperature_lse,
+            return_softmax_lse=return_softmax_lse,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            page_table=page_table,
+            seqused_k=seqused_k,
+        )
     max_num_kv_blocks = _csr_row_capacity(k2q_row_ptr)
     temperature_lse_fast_path = (
         return_temperature_lse

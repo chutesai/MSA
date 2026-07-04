@@ -22,6 +22,17 @@ import jinja2
 
 logger = logging.getLogger(__name__)
 
+def _target_cuda_arch() -> str:
+    """Target architecture for the runtime-compiled csrc kernels.
+
+    Defaults to SM100/SM103; set FMHA_CUDA_ARCH (e.g. ``120`` for RTX PRO
+    6000 Blackwell, which reports compute capability 12.0) to retarget.
+    """
+    arch = os.environ.get("FMHA_CUDA_ARCH", "100a").strip().lower()
+    arch = arch.removeprefix("sm_").removeprefix("compute_")
+    return arch or "100a"
+
+
 def _compute_cache_base():
     explicit = os.environ.get("MINFER_FMHA_CACHE_DIR")
     if explicit:
@@ -35,6 +46,9 @@ def _compute_cache_base():
         suffix += "_sm_timing"
     if os.environ.get("FMHA_GMEM_CHECK") is not None:
         suffix += "_gmem_check"
+    target_arch = _target_cuda_arch()
+    if target_arch != "100a":
+        suffix += f"_sm{target_arch}"
     if suffix:
         base = base.parent / (base.name + suffix)
     return base
@@ -194,11 +208,20 @@ def _get_nvcc_flags(cache_dir, fmha=True):
     fmha_include = str(_FMHA_VARLEN_DIR / "include")
     cutlass_include = str(_CUTLASS_INCLUDE)
     cutlass_util_include = str(_CUTLASS_UTIL_INCLUDE)
+    target_arch = _target_cuda_arch()
+    if target_arch == "100a":
+        arch_flags = [
+            "-gencode=arch=compute_100a,code=sm_100a",
+            "-gencode=arch=compute_103a,code=sm_103a",
+        ]
+    else:
+        arch_flags = [
+            f"-gencode=arch=compute_{target_arch},code=sm_{target_arch}",
+        ]
     nvcc_flags = [
         "-O3", "-std=c++20",
         "--expt-relaxed-constexpr", "--expt-extended-lambda",
-        "-gencode=arch=compute_100a,code=sm_100a",
-        "-gencode=arch=compute_103a,code=sm_103a",
+        *arch_flags,
         "-static-global-template-stub=false",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
@@ -219,6 +242,15 @@ def _get_nvcc_flags(cache_dir, fmha=True):
         "-DNDEBUG", "-Xptxas", "-O1" if fmha else "-O3",
         "-Xcompiler", "-fPIC",
     ]
+    if target_arch == "120":
+        # RTX PRO 6000 Blackwell has far less opt-in dynamic shared memory per
+        # block than the SM100 planner assumes. Keep SM100 defaults untouched,
+        # but compile the planning kernel with a smaller shared-memory state on
+        # SM120. Runtime scheduling is capped to the same value in api.py.
+        nvcc_flags.extend([
+            f"-DFMHA_PLAN_MAX_SMS={os.environ.get('FMHA_PLAN_MAX_CTAS', '128')}",
+            f"-DFMHA_PLAN_MAX_TASKS_PER_SM={os.environ.get('FMHA_PLAN_MAX_TASKS_PER_SM', '48')}",
+        ])
     if os.environ.get("GPU_TRACE") is not None:
         nvcc_flags.append("-DGPU_TRACE_ENABLED")
     if os.environ.get("SM_TIMING") is not None:
