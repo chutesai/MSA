@@ -170,6 +170,11 @@ instead:
   support; the packed-input paths do not).
 - **Decode** (`sparse_decode_atten_func`, `SparseDecodePagedAttentionWrapper`):
   paged FP8 decode.
+- **FP4 indexer** (`fp4_indexer_block_scores`): on SM120 the block-score pass
+  dispatches to a Triton kernel using native block-scaled FP4 MMA
+  (`src/sm120/fp4_indexer.py`; MXFP4, public scale layout). Scoring is dense
+  and compute-bound, so FP4 pays fully here (~3x over a BF16 cuBLAS scoring
+  baseline at seq 8192) while only affecting top-k page *selection*.
 - A pure-PyTorch reference (`src/sm120/reference.py`) backs every path as a
   correctness oracle and functional fallback.
 

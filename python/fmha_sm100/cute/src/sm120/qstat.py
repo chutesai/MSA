@@ -807,7 +807,9 @@ def qstat_backward(
         SUB_N=int(sub_n),
         DIM=int(dim),
         num_warps=8,
-        num_stages=1,
+        # Two stages software-pipeline the per-chunk Q/dO gathers against the
+        # MMAs (the K/V tiles are loop-invariant); measured ~5% on the step.
+        num_stages=2,
     )
     if nsplit > 1:
         dk = dk_out.sum(dim=0).to(kv_grad_dtype)

@@ -27,6 +27,7 @@ python tests/sm120/test_nvfp4_train.py
 FMHA_SM120_PARTIAL_DTYPE=fp32 python tests/sm120/test_triton_backward.py
 python tests/sm120/test_autograd_guard.py
 python tests/sm120/test_qstat.py
+python tests/sm120/test_indexer_fp4.py
 python tests/sm120/test_decode.py
 FMHA_SM120_DECODE_SPLIT_PAGES=2 python tests/sm120/test_decode.py
 python benchmarks/bench_sm120_triton.py --seq 2048 --topk 16 --causal --iters 20 --warmup 5 --modes two_phase,recompute,row

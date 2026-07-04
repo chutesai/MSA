@@ -813,6 +813,30 @@ def fp4_indexer_block_scores(
     spec = normalize_fp4_format(fp4_format)
     causal = bool(causal)
     scale_layout = normalize_scale_layout(scale_layout)
+    if _device_arch(q_fp4.device) >= (12, 0):
+        # SM120 has no tcgen05; route to the Triton block-scaled MMA kernel,
+        # which takes the public (logical) scale layout directly.
+        if scale_layout != _PUBLIC_SCALE_LAYOUT:
+            raise NotImplementedError(
+                "SM120 FP4 indexer requires scale_layout='public'"
+            )
+        from src.sm120.fp4_indexer import fp4_indexer_block_scores_triton
+
+        return fp4_indexer_block_scores_triton(
+            q_fp4,
+            k_fp4,
+            q_scale,
+            k_scale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_page_offsets,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            kv_indices=kv_indices,
+            fp4_format=spec.name,
+            causal=causal,
+            qo_offset=qo_offset,
+        )
     use_preordered_q_scale_tma = int(max_seqlen_q) >= _PAGE_SIZE
     q_bytes = _as_fp4_thd_bytes(q_fp4, name="q_fp4")
     k_bytes = _as_fp4_paged_hnd_bytes(k_fp4, name="k_fp4")
