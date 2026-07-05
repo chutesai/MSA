@@ -656,6 +656,12 @@ static void launch_pipeline(
     while (kWarps_pick > 1 && (kWarps_pick * per_warp_smem) * 2 > smem_optin) {
         kWarps_pick >>= 1;
     }
+    // Prefer staying under the 48KB default dynamic-smem limit so the
+    // cudaFuncSetAttribute opt-in (fragile in heavyweight processes) is
+    // never needed; only truly enormous total_rows keep it.
+    while (kWarps_pick > 1 && kWarps_pick * per_warp_smem > 48 * 1024) {
+        kWarps_pick >>= 1;
+    }
     if (kWarps_pick < 1) kWarps_pick = 1;
 
     // -- Pick G (CTAs) ----------------------------------------------------
@@ -702,12 +708,31 @@ static void launch_pipeline(
         size_t smem_bytes = (size_t)W * per_warp_smem;
         auto hist_fn = k2q_hist_kernel<kTopK, kBlockK, W>;
         auto scat_fn = k2q_scatter_kernel<kTopK, kBlockK, W>;
-        AT_CUDA_CHECK(cudaFuncSetAttribute(
-            hist_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
-        K2Q_CHECKPOINT("funcattr_hist");
-        AT_CUDA_CHECK(cudaFuncSetAttribute(
-            scat_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
-        K2Q_CHECKPOINT("funcattr_scat");
+        if (k2q_debug_enabled()) {
+            cudaFuncAttributes fa{};
+            cudaError_t fe = cudaFuncGetAttributes(&fa, (const void*)hist_fn);
+            fprintf(stderr,
+                    "[k2q-debug] hist_fn=%p resolve=%s smem_bytes=%zu "
+                    "per_warp=%d W=%d total_rows=%d\n",
+                    (void*)hist_fn,
+                    fe == cudaSuccess ? "ok" : cudaGetErrorString(fe),
+                    smem_bytes, per_warp_smem, W, total_rows);
+            fflush(stderr);
+            (void)cudaGetLastError();
+        }
+        // cudaFuncSetAttribute is only required when the dynamic smem request
+        // exceeds the 48KB default. In heavyweight multi-library processes the
+        // attribute call has been observed to fail with invalid-resource-handle
+        // on an otherwise launchable kernel (mesh-forward reports), so avoid it
+        // whenever it is unnecessary.
+        if (smem_bytes > 48 * 1024) {
+            AT_CUDA_CHECK(cudaFuncSetAttribute(
+                hist_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+            K2Q_CHECKPOINT("funcattr_hist");
+            AT_CUDA_CHECK(cudaFuncSetAttribute(
+                scat_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+            K2Q_CHECKPOINT("funcattr_scat");
+        }
 
         hist_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
             q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
