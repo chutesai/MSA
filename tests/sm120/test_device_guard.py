@@ -44,6 +44,30 @@ def run_case(tensor_dev, current_dev):
     print(f"ok: tensors on {tensor_dev}, current device {current_dev}")
 
 
+def make_q2k_big(hkv, total, topk, device):
+    """Vectorized local-window selection for large shapes (no python loop)."""
+    blk = torch.arange(total, device=device) // 128
+    offs = torch.arange(topk, device=device)
+    sel = (blk[:, None] - offs[None, :]).clamp_min(-1).to(torch.int32)
+    key = torch.where(sel < 0, torch.full_like(sel, 1 << 20), sel)
+    order = torch.argsort(key, dim=-1)
+    sel = torch.gather(sel, -1, order)  # ascending valid ids, -1s at the tail
+    return sel.unsqueeze(0).expand(hkv, total, topk).contiguous()
+
+
+def run_big_case(device):
+    """Large total_rows exercises the tile-prefix rows-per-block dispatch."""
+    S, B, hkv, topk, g = 65536, 1, 2, 4, 4
+    total = B * S
+    q2k = make_q2k_big(hkv, total, topk, device)
+    cu = torch.arange(0, B + 1, device=device, dtype=torch.int32) * S
+    row, idx, sched = build_k2q_csr(
+        q2k, cu, cu, 128, total_k=total, max_seqlen_k=S, max_seqlen_q=S,
+        total_rows=B * (S // 128), qhead_per_kv=g, return_schedule=True)
+    torch.cuda.synchronize(device)
+    print(f"ok big-case on {device} (total_rows={B * (S // 128)})")
+
+
 import pytest  # noqa: E402
 
 
@@ -52,6 +76,7 @@ def test_build_k2q_csr_cross_device():
     run_case("cuda:0", "cuda:0")
     run_case("cuda:0", "cuda:1")
     run_case("cuda:1", "cuda:0")
+    run_big_case("cuda:0")
     print("DEVICE_GUARD_TEST_OK")
 
 

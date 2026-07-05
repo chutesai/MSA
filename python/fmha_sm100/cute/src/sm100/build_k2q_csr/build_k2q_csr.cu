@@ -90,6 +90,7 @@ static void k2q_debug_entry(const char* fn, const torch::Tensor& q2k,
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <type_traits>
 
 #define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be CUDA")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
@@ -752,17 +753,35 @@ static void launch_pipeline(
 
         // Grid is H * blocks_per_h so each block stays within a single
         // head; flat (H*total_rows) grid would skip rows when total_rows
-        // is not a multiple of kPtRowsPerBlock.
-        int blocks_per_h = (total_rows + kPtRowsPerBlock - 1) / kPtRowsPerBlock;
-        int pt_grid = H * blocks_per_h;
-        if (pt_grid < 1) pt_grid = 1;
-        size_t pt_smem = (size_t)kPtRowsPerBlock * G_total * sizeof(int);
-        AT_CUDA_CHECK(cudaFuncSetAttribute(
-            tprefix_smem_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)pt_smem));
-        tprefix_smem_fn<<<pt_grid, kPtThreads, pt_smem, stream>>>(
-            tile_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
-            H, total_rows, G_total);
+        // is not a multiple of the rows-per-block. Rows-per-block is chosen
+        // so dynamic smem stays under the 48KB default, which keeps this
+        // kernel off the cudaFuncSetAttribute opt-in path entirely (fragile
+        // in heavyweight multi-fatbin processes; see hist/scat above).
+        auto launch_tprefix = [&](auto rpb_const) {
+            constexpr int RPB = decltype(rpb_const)::value;
+            auto fn = k2q_tile_prefix_smem_kernel<kPtThreads, RPB>;
+            int blocks_per_h = (total_rows + RPB - 1) / RPB;
+            int pt_grid = H * blocks_per_h;
+            if (pt_grid < 1) pt_grid = 1;
+            size_t pt_smem = (size_t)RPB * G_total * sizeof(int);
+            TORCH_CHECK(pt_smem <= 48 * 1024,
+                        "tile-prefix smem exceeds 48KB even at 1 row/block");
+            fn<<<pt_grid, kPtThreads, pt_smem, stream>>>(
+                tile_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
+                H, total_rows, G_total);
+        };
+        {
+            const size_t g_bytes = (size_t)G_total * sizeof(int);
+            if (kPtRowsPerBlock * g_bytes <= 48 * 1024) {
+                launch_tprefix(std::integral_constant<int, kPtRowsPerBlock>{});
+            } else if (4 * g_bytes <= 48 * 1024) {
+                launch_tprefix(std::integral_constant<int, 4>{});
+            } else if (2 * g_bytes <= 48 * 1024) {
+                launch_tprefix(std::integral_constant<int, 2>{});
+            } else {
+                launch_tprefix(std::integral_constant<int, 1>{});
+            }
+        }
         K2Q_CHECKPOINT("tprefix_smem_fn_launch");
 
         scat_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
