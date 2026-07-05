@@ -1075,9 +1075,21 @@ class _QstatSparseAttentionFp8(torch.autograd.Function):
                 f"FMHA_SM120_QSTAT_GRADS must be bf16 or fp8, got {grads_impl!r}"
             )
         if grads_impl == "fp8" and blk_kv == 128 and q.shape[-1] == 128 and seq_len % 16 == 0:
-            # EXPERIMENTAL full-e4m3 backward (gradient quantization; gate
-            # adoption on a loss-level A/B). ~0.999 cosine / 4-5% mean
-            # relative deviation vs the bf16 backward.
+            # EXPERIMENTAL full-e4m3 backward — NOT validated for production
+            # training: a real run NaN'd at ~step 1000 (d1024, lr 3e-4
+            # warmup, 8xDDP) with these gradients; per-row e4m3 amax scaling
+            # is fragile under heavy-tailed gradient outliers. Do not adopt
+            # without a >=2k-step loss A/B at your exact config. An
+            # e5m2-gradient rework is the planned path to re-qualification.
+            import warnings
+
+            warnings.warn(
+                "FMHA_SM120_QSTAT_GRADS=fp8 is EXPERIMENTAL and has produced "
+                "NaNs in real training (step ~1k). Use bf16 grads for "
+                "production; gate any fp8-grads adoption on a >=2k-step "
+                "loss A/B.",
+                stacklevel=2,
+            )
             from src.sm120.qstat_cuda import qstat_backward_fp8_cuda
 
             _, _, selbits = build_tile_block_union(
