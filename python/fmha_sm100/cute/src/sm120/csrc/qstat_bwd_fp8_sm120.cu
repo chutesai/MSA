@@ -811,8 +811,9 @@ void qstat_dkdv_fp8(
         TORCH_CHECK(_fa == cudaSuccess, \
             "cudaFuncSetAttribute failed (", cudaGetErrorString(_fa), \
             "): known failure mode in heavyweight multi-fatbin processes; " \
-            "set FMHA_SM120_QSTAT_IMPL=triton (or FMHA_SM120_QSTAT_GRADS=bf16) " \
-            "to route around this kernel."); \
+            "set FMHA_SM120_QSTAT_GRADS=bf16 to route around this kernel " \
+            "(the fp8 backward wrapper normally probes and falls back to " \
+            "the Triton dK/dV automatically)."); \
       } \
       qstat_dkdv_fp8_kernel<BT><<<grid, block, smem, stream>>>( \
           q8.data_ptr<unsigned char>(), qsc.data_ptr<float>(), \
@@ -894,8 +895,25 @@ void qstat_quant_rows(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+bool qstat_dkdv_fp8_supported() {
+  // dkdv needs >48KB dynamic smem, hence cudaFuncSetAttribute — which fails
+  // with invalid-resource-handle in some heavyweight multi-fatbin processes.
+  // Probe once so callers can route dK/dV to the Triton kernel instead.
+  cudaError_t e = cudaFuncSetAttribute(
+      qstat_dkdv_fp8_kernel<16>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize,
+      (int)sizeof(SharedStorageDkdv));
+  if (e != cudaSuccess) {
+    (void)cudaGetLastError();  // clear
+    return false;
+  }
+  return true;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("qstat_dq_fp8", &qstat_dq_fp8, "qstat dQ backward, full e4m3");
   m.def("qstat_dkdv_fp8", &qstat_dkdv_fp8, "qstat dK/dV backward, full e4m3");
   m.def("qstat_quant_rows", &qstat_quant_rows, "per-row e4m3 quant of Q and dO*vs");
+  m.def("qstat_dkdv_fp8_supported", &qstat_dkdv_fp8_supported,
+        "probe whether the >48KB dkdv kernel can opt in on this process");
 }

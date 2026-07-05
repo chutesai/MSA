@@ -1083,3 +1083,79 @@ def fp4_indexer_block_scores(
 __all__ = [
     "fp4_indexer_block_scores",
 ]
+
+
+def fp4_indexer_topk(
+    q_fp4: torch.Tensor,
+    k_fp4: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    cu_page_offsets: torch.Tensor,
+    *,
+    topk: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    kv_indices: torch.Tensor,
+    fp4_format: str = "mxfp4",
+    causal: bool = True,
+    scale_layout: str = "public",
+    qo_offset: Optional[torch.Tensor] = None,
+    force_diagonal_blocks: int = 1,
+    force_begin_blocks: int = 0,
+) -> torch.Tensor:
+    """Fused FP4 block scoring + top-k page selection.
+
+    Returns ``q2k`` int32 ``[Hq, total_q, topk]`` (ascending block ids, -1
+    tail — the MSA selection contract) without materializing block scores.
+    On SM120 this is a single Triton kernel; elsewhere it falls back to
+    ``fp4_indexer_block_scores`` plus a torch selection pass.
+    """
+    if _device_arch(q_fp4.device) >= (12, 0):
+        if normalize_scale_layout(scale_layout) != "public":
+            raise NotImplementedError("fp4_indexer_topk requires scale_layout='public' on SM120")
+        from src.sm120.fp4_indexer import fp4_indexer_topk as _sm120_topk
+
+        return _sm120_topk(
+            q_fp4, k_fp4, q_scale, k_scale,
+            cu_seqlens_q, cu_seqlens_k, cu_page_offsets,
+            topk=topk, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+            kv_indices=kv_indices, fp4_format=fp4_format, causal=causal,
+            qo_offset=qo_offset,
+            force_diagonal_blocks=force_diagonal_blocks,
+            force_begin_blocks=force_begin_blocks,
+        )
+    # Generic fallback: scores kernel + torch selection.
+    scores = fp4_indexer_block_scores(
+        q_fp4, k_fp4, q_scale, k_scale,
+        cu_seqlens_q, cu_seqlens_k, cu_page_offsets,
+        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        kv_indices=kv_indices, fp4_format=fp4_format, causal=causal,
+        scale_layout=scale_layout, qo_offset=qo_offset,
+    )
+    hq, tiles, total_q = scores.shape
+    s_t = scores.permute(0, 2, 1)  # [Hq, total_q, tiles]
+    if force_diagonal_blocks:
+        # per-query local block: q position within its sequence + offset
+        seq_id = torch.bucketize(
+            torch.arange(total_q, device=scores.device),
+            cu_seqlens_q[1:].long(), right=True,
+        )
+        local = torch.arange(total_q, device=scores.device) - cu_seqlens_q[seq_id].long()
+        k_len = (cu_seqlens_k[seq_id + 1] - cu_seqlens_k[seq_id]).long()
+        q_len = (cu_seqlens_q[seq_id + 1] - cu_seqlens_q[seq_id]).long()
+        diag = ((local + (k_len - q_len)).clamp_min(0) // 128)
+        s_t = s_t.clone()
+        s_t[torch.arange(hq)[:, None], torch.arange(total_q)[None, :], diag[None, :]] = float("inf")
+    if force_begin_blocks:
+        s_t = s_t.clone()
+        s_t[..., :force_begin_blocks] = float("inf")
+    vals, idx = s_t.topk(min(topk, tiles), dim=-1)
+    idx = torch.where(torch.isfinite(vals) | torch.isinf(vals), idx.int(), idx.new_full((), -1).int())
+    idx = torch.where(vals == float("-inf"), idx.new_full((), 2 ** 30).int(), idx.int())
+    idx, _ = idx.sort(dim=-1)
+    idx = torch.where(idx >= 2 ** 30, idx.new_full((), -1).int(), idx)
+    out = torch.full((hq, total_q, topk), -1, dtype=torch.int32, device=scores.device)
+    out[..., : idx.shape[-1]] = idx
+    return out

@@ -144,6 +144,7 @@ def qstat_backward_fp8_cuda(
     total_q, head_q, dim = q.shape
     head_kv = k_fp8_u8.shape[1]
     g = head_q // head_kv
+    dkdv_fp8_ok = _dkdv_fp8_supported()
     # Row-quantize Q and dO' = dO * v_scale[channel] in one pass.
     q8 = torch.empty((total_q, head_q, dim), device=q.device, dtype=torch.uint8)
     do8 = torch.empty_like(q8)
@@ -171,12 +172,61 @@ def qstat_backward_fp8_cuda(
     else:
         dk = torch.empty((total_q, head_kv, dim), device=q.device, dtype=kv_grad_dtype)
         dv = torch.empty_like(dk)
-    ext.qstat_dkdv_fp8(
-        q8, qsc, do8, dosc, k_fp8_u8, v_fp8_u8, k_scale, v_scale, lse, delta,
-        k2q_row_ptr, k2q_q_indices, row_batch, row_kv_block, dk, dv,
-        seq_len, block_tq, topk, nsplit, softmax_scale,
-    )
+    if dkdv_fp8_ok:
+        ext.qstat_dkdv_fp8(
+            q8, qsc, do8, dosc, k_fp8_u8, v_fp8_u8, k_scale, v_scale, lse, delta,
+            k2q_row_ptr, k2q_q_indices, row_batch, row_kv_block, dk, dv,
+            seq_len, block_tq, topk, nsplit, softmax_scale,
+        )
+    else:
+        # Mixed mode for processes where the >48KB opt-in is unavailable:
+        # keep the (48KB, mesh-safe) CUDA dQ above and run dK/dV through the
+        # Triton kernel on dequantized K/V. Same math as the bf16 backward.
+        from src.sm120.qstat import _pick_block_t, _qstat_bwd_dkdv_kernel
+
+        k_deq = (
+            k_fp8_u8.view(torch.float8_e4m3fn).float() * k_scale.unsqueeze(-1)
+        ).to(q.dtype)
+        v_deq = (
+            v_fp8_u8.view(torch.float8_e4m3fn).float() * v_scale.unsqueeze(0)
+        ).to(q.dtype)
+        total_rows = row_batch.shape[0]
+        sub_n = 64
+        nsub = 128 // sub_n
+        grad_split_stride = (
+            total_q * head_kv * dim if nsplit > 1 else 0
+        )
+        dummy = torch.empty(0, device=q.device, dtype=torch.float32)
+        grid_dkdv = (total_rows * nsub, head_kv, nsplit)
+        _qstat_bwd_dkdv_kernel[grid_dkdv](
+            q, k_deq, v_deq, k2q_row_ptr, k2q_q_indices, row_batch,
+            row_kv_block, dummy, dummy, lse, delta, dout, dk, dv,
+            int(grad_split_stride), float(softmax_scale), int(total_q),
+            int(total_rows), int(seq_len), int(head_q), int(head_kv),
+            int(g), int(topk), False, False,
+            NSPLIT=int(nsplit), BLOCK_TQ=int(block_tq), BLK_KV=128,
+            SUB_N=int(sub_n), DIM=int(dim), num_warps=8, num_stages=2,
+        )
     if nsplit > 1:
         dk = dk.sum(0).to(kv_grad_dtype)
         dv = dv.sum(0).to(kv_grad_dtype)
     return dq, dk, dv
+
+
+@lru_cache(maxsize=1)
+def _dkdv_fp8_supported() -> bool:
+    # FMHA_SM120_QSTAT_DKDV_FP8=0 forces the Triton dK/dV fallback (testing /
+    # belt-and-suspenders for processes where the probe itself misbehaves).
+    if os.environ.get("FMHA_SM120_QSTAT_DKDV_FP8", "auto") == "0":
+        return False
+    ok = bool(_ext_bwd_fp8().qstat_dkdv_fp8_supported())
+    if not ok:
+        import warnings
+
+        warnings.warn(
+            "qstat dK/dV fp8 kernel cannot opt into >48KB shared memory in "
+            "this process (many-fatbin cudaFuncSetAttribute failure); "
+            "FMHA_SM120_QSTAT_GRADS=fp8 will run CUDA dQ + Triton dK/dV.",
+            stacklevel=2,
+        )
+    return ok
