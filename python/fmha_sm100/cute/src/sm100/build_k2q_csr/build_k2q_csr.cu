@@ -24,6 +24,68 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
+
+// MSA_K2Q_DEBUG=1: print entry state (device / driver context / stream) and
+// check cudaGetLastError after every CUDA call with a distinct tag, so a
+// failure inside an aggregate sync can be pinned to the exact API call.
+// MSA_K2Q_LEGACY_STREAM=1: launch on the legacy default stream, which is
+// valid in ANY driver context — escape hatch for frameworks that leave a
+// non-primary context current (torch stream handles then become invalid).
+static bool k2q_debug_enabled() {
+    static const bool v = [] {
+        const char* e = std::getenv("MSA_K2Q_DEBUG");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+static bool k2q_legacy_stream() {
+    static const bool v = [] {
+        const char* e = std::getenv("MSA_K2Q_LEGACY_STREAM");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+
+#define K2Q_CHECKPOINT(tag) do { \
+    if (k2q_debug_enabled()) { \
+        cudaError_t _e = cudaGetLastError(); \
+        fprintf(stderr, "[k2q-debug] %-24s : %s\n", tag, \
+                _e == cudaSuccess ? "ok" : cudaGetErrorString(_e)); \
+        fflush(stderr); \
+    } } while (0)
+
+// Driver context via dlsym: libcuda is loaded by torch; the extension
+// itself must not link -lcuda.
+static void* k2q_current_ctx() {
+    using fn_t = int (*)(void**);
+    static fn_t fn = reinterpret_cast<fn_t>(dlsym(RTLD_DEFAULT, "cuCtxGetCurrent"));
+    void* ctx = nullptr;
+    if (fn) fn(&ctx);
+    return ctx;
+}
+
+static void k2q_debug_entry(const char* fn, const torch::Tensor& q2k,
+                            cudaStream_t stream) {
+    if (!k2q_debug_enabled()) return;
+    int dev = -1;
+    cudaGetDevice(&dev);
+    void* ctx = k2q_current_ctx();
+    fprintf(stderr,
+            "[k2q-debug] enter %s: tensor_dev=%d current_dev=%d "
+            "driver_ctx=%p stream=%p legacy=%d\n",
+            fn, (int)q2k.get_device(), dev, (void*)ctx, (void*)stream,
+            (int)k2q_legacy_stream());
+    fflush(stderr);
+    cudaError_t sticky = cudaGetLastError();
+    if (sticky != cudaSuccess)
+        fprintf(stderr, "[k2q-debug] PRE-EXISTING error at entry: %s\n",
+                cudaGetErrorString(sticky));
+}
+
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -546,13 +608,18 @@ static void launch_pipeline(
     int B = (int)cu_q.size(0) - 1;
     auto device = q2k.device();
     cudaStream_t stream = at::cuda::getCurrentCUDAStream(q2k.get_device());
+    if (k2q_legacy_stream()) stream = nullptr;  // legacy default stream
+    k2q_debug_entry(__func__, q2k, stream);
+    K2Q_CHECKPOINT("entry");
 
     AT_CUDA_CHECK(cudaMemsetAsync(
         row_ptr.data_ptr<int>(), 0,
         (size_t)H * (total_rows + 1) * sizeof(int), stream));
+    K2Q_CHECKPOINT("memset_row_ptr");
     AT_CUDA_CHECK(cudaMemsetAsync(
         q_idx.data_ptr<int>(), 0xFF,
         (size_t)H * S_Q * kTopK * sizeof(int), stream));
+    K2Q_CHECKPOINT("memset_q_idx");
 
     auto opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
     auto row_counts = torch::zeros({H, total_rows}, opts);
@@ -582,8 +649,11 @@ static void launch_pipeline(
     // Pick the largest kWarps that fits two CTAs/SM, capped at 4.
     // SMEM cursor packed as int16 (2 entries per int32 word):
     int per_warp_smem = ((total_rows + 1) >> 1) * (int)sizeof(int);
+    int smem_optin = 228 * 1024;
+    AT_CUDA_CHECK(cudaDeviceGetAttribute(
+        &smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
     int kWarps_pick = 4;
-    while (kWarps_pick > 1 && (kWarps_pick * per_warp_smem) * 2 > 228 * 1024) {
+    while (kWarps_pick > 1 && (kWarps_pick * per_warp_smem) * 2 > smem_optin) {
         kWarps_pick >>= 1;
     }
     if (kWarps_pick < 1) kWarps_pick = 1;
@@ -595,7 +665,7 @@ static void launch_pipeline(
     // the memory pipeline runs at peak.
     int per_cta_smem_bytes = kWarps_pick * per_warp_smem;
     int max_ctas_per_sm = std::max(
-        1, (228 * 1024) / std::max(1, per_cta_smem_bytes));
+        1, smem_optin / std::max(1, per_cta_smem_bytes));
     if (max_ctas_per_sm > 8) max_ctas_per_sm = 8;
     constexpr int kMinQPerCta = 256;
     // Cap target_g at num_sms * 3 — empirically this balances
@@ -624,6 +694,7 @@ static void launch_pipeline(
     if (max_kv_blocks > 0) {
         rmap_fn<<<max_kv_blocks, 32, 0, stream>>>(
             cu_k.data_ptr<int>(), row_map.data_ptr<int>(), row_coords_ptr, B, max_kv_blocks);
+        K2Q_CHECKPOINT("rmap_launch");
     }
 
     auto launch_hist_scatter = [&](auto kWarps_const) {
@@ -633,13 +704,16 @@ static void launch_pipeline(
         auto scat_fn = k2q_scatter_kernel<kTopK, kBlockK, W>;
         AT_CUDA_CHECK(cudaFuncSetAttribute(
             hist_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+        K2Q_CHECKPOINT("funcattr_hist");
         AT_CUDA_CHECK(cudaFuncSetAttribute(
             scat_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
+        K2Q_CHECKPOINT("funcattr_scat");
 
         hist_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
             q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
             row_counts.data_ptr<int>(), tile_counts.data_ptr<int>(),
             H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp);
+        K2Q_CHECKPOINT("hist_fn_launch");
 
         rprefix_fn<<<H, 1024, 0, stream>>>(
             row_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
@@ -649,6 +723,7 @@ static void launch_pipeline(
             total_rows,
             target_q_per_cta,
             work_capacity);
+        K2Q_CHECKPOINT("rprefix_fn_launch");
 
         // Grid is H * blocks_per_h so each block stays within a single
         // head; flat (H*total_rows) grid would skip rows when total_rows
@@ -663,6 +738,7 @@ static void launch_pipeline(
         tprefix_smem_fn<<<pt_grid, kPtThreads, pt_smem, stream>>>(
             tile_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
             H, total_rows, G_total);
+        K2Q_CHECKPOINT("tprefix_smem_fn_launch");
 
         scat_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
             q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
@@ -670,6 +746,7 @@ static void launch_pipeline(
             qsplit_idx_ptr, split_counts_ptr,
             H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp,
             max_seqlen_q);
+        K2Q_CHECKPOINT("scat_fn_launch");
     };
 
     if (kWarps_pick == 4) {
@@ -714,6 +791,9 @@ void run_build_k2q_csr(
                 "q_idx shape mismatch");
     if (S_Q == 0 || tr == 0 || H == 0 || mkv == 0) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream(q2k.get_device());
+    if (k2q_legacy_stream()) stream = nullptr;
+    k2q_debug_entry(__func__, q2k, stream);
+    K2Q_CHECKPOINT("entry");
         AT_CUDA_CHECK(cudaMemsetAsync(
             row_ptr.data_ptr<int>(), 0,
             (size_t)H * (tr + 1) * sizeof(int), stream));
@@ -787,6 +867,9 @@ void run_build_k2q_csr_with_schedule(
                 "split_counts shape mismatch");
     if (S_Q == 0 || tr == 0 || H == 0 || mkv == 0) {
         cudaStream_t stream = at::cuda::getCurrentCUDAStream(q2k.get_device());
+    if (k2q_legacy_stream()) stream = nullptr;
+    k2q_debug_entry(__func__, q2k, stream);
+    K2Q_CHECKPOINT("entry");
         AT_CUDA_CHECK(cudaMemsetAsync(
             row_ptr.data_ptr<int>(), 0,
             (size_t)H * (tr + 1) * sizeof(int), stream));
