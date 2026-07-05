@@ -446,11 +446,11 @@ qstat_dkdv_fp8_kernel(
 }
 
 
+// Exactly 48KB (see fwd fp8): no cudaFuncSetAttribute opt-in required.
 struct SharedStorageDq {
   unsigned char k8[kBlkKV * kDim];    // token-major (S)
   unsigned char k8t[kDim * kBlkKV];   // dim-major (dsK)
   unsigned char v8[kBlkKV * kDim];    // token-major (dp)
-  float ksc[kBlkKV];
 };
 
 template <int BLOCK_T>
@@ -596,15 +596,6 @@ qstat_dq_fp8_kernel(
       const long gt = ((long)kv_head * kDim + tok) * total_kv + kv_base + (okt ? post : 0);
       cp_async_16(smem_u32(&smem.k8t[sw_off8(tok, cb)]), k8tg + gt, okt);
     }
-    if (threadIdx.x < 32) {
-      const int t4 = threadIdx.x * 4;
-      #pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        const long p_e = (long)blk * kBlkKV + t4 + e;
-        smem.ksc[t4 + e] =
-            (p_e < seq_len) ? kscale[(kv_base + p_e) * heads_kv + kv_head] : 0.f;
-      }
-    }
   };
 
   for (int u = 0; u < cnt; ++u) {
@@ -654,7 +645,7 @@ qstat_dq_fp8_kernel(
           float& dv_ = dp_acc[n][r * 2 + e];
           const bool vis = sel_r[r] && valid_r[r] && fin_r[r] &&
                            pos < seq_len && pos <= t_r[r];
-          const float ks = smem.ksc[tok];
+          const float ks = vis ? __ldg(&kscale[(kv_base + pos) * heads_kv + kv_head]) : 0.f;
           const float p = vis ? __expf(sv * (q_sc[r] * scale) * ks - lse_safe[r]) : 0.f;
           const float dp_real = dv_ * do_sc[r];
           dv_ = p * (dp_real - dl[r]) * ks;
@@ -814,8 +805,15 @@ void qstat_dkdv_fp8(
   TORCH_CHECK(block_tq * (heads_q / heads_kv) == kMRows, "block_tq * g must be 64");
   #define DISPATCH(BT) \
     if (block_tq == BT) { \
-      cudaFuncSetAttribute(qstat_dkdv_fp8_kernel<BT>, \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+      { \
+        cudaError_t _fa = cudaFuncSetAttribute(qstat_dkdv_fp8_kernel<BT>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+        TORCH_CHECK(_fa == cudaSuccess, \
+            "cudaFuncSetAttribute failed (", cudaGetErrorString(_fa), \
+            "): known failure mode in heavyweight multi-fatbin processes; " \
+            "set FMHA_SM120_QSTAT_IMPL=triton (or FMHA_SM120_QSTAT_GRADS=bf16) " \
+            "to route around this kernel."); \
+      } \
       qstat_dkdv_fp8_kernel<BT><<<grid, block, smem, stream>>>( \
           q8.data_ptr<unsigned char>(), qsc.data_ptr<float>(), \
           do8.data_ptr<unsigned char>(), dosc.data_ptr<float>(), \
@@ -857,8 +855,10 @@ torch::Tensor qstat_dq_fp8(
   TORCH_CHECK(block_t * (heads_q / heads_kv) == kMRows, "block_t * g must be 64");
   #define DISPATCH(BT) \
     if (block_t == BT) { \
-      cudaFuncSetAttribute(qstat_dq_fp8_kernel<BT>, \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+      if (smem > 48 * 1024) { \
+        cudaFuncSetAttribute(qstat_dq_fp8_kernel<BT>, \
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+      } \
       qstat_dq_fp8_kernel<BT><<<grid, block, smem, stream>>>( \
           reinterpret_cast<const bf16*>(q.data_ptr()), \
           k8.data_ptr<unsigned char>(), k8t.data_ptr<unsigned char>(), \

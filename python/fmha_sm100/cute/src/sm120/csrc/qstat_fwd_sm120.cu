@@ -324,8 +324,15 @@ torch::Tensor qstat_fwd_v3(
   TORCH_CHECK(block_t * g == kMRows, "block_t * qhead_per_kv must be 64");
   #define DISPATCH(BT) \
     if (block_t == BT) { \
-      cudaFuncSetAttribute(qstat_fwd_v3_kernel<BT>, \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+      { \
+        cudaError_t _fa = cudaFuncSetAttribute(qstat_fwd_v3_kernel<BT>, \
+            cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+        TORCH_CHECK(_fa == cudaSuccess, \
+            "cudaFuncSetAttribute failed (", cudaGetErrorString(_fa), \
+            "): known failure mode in heavyweight multi-fatbin processes; " \
+            "set FMHA_SM120_QSTAT_IMPL=triton (or FMHA_SM120_QSTAT_GRADS=bf16) " \
+            "to route around this kernel."); \
+      } \
       qstat_fwd_v3_kernel<BT><<<grid, block, smem, stream>>>( \
           reinterpret_cast<const bf16*>(q.data_ptr()), \
           reinterpret_cast<const bf16*>(k.data_ptr()), \

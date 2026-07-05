@@ -93,10 +93,13 @@ DEVINL unsigned pack_e4m3x4(float x0, float x1, float x2, float x3) {
   return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
 }
 
+// Exactly 48KB: staying at or below the default dynamic-smem limit keeps
+// this kernel off the cudaFuncSetAttribute opt-in path, which fails with
+// invalid-resource-handle in heavyweight multi-fatbin processes (mesh
+// forwards). Per-token K scales are read through L2 instead of smem.
 struct SharedStorage {
   unsigned char k8[2][kBlkKV * kDim];   // e4m3 K ring: 2x16KB (swizzled bytes)
   unsigned char v8t[kDim * kBlkKV];     // e4m3 V, dim-major rows: 16KB
-  float ksc[2][kBlkKV];                 // per-token K scales, ring
 };
 
 template <int BLOCK_T>
@@ -206,23 +209,6 @@ qstat_fwd_fp8v2_kernel(
       const long g = ((kv_base + (ok ? pos : 0)) * heads_kv + kv_head) * kDim + cb;
       cp_async_16(smem_u32(&smem.k8[buf][sw_off8(tok, cb)]), k8 + g, ok);
     }
-    // Per-token scales: 128 f32 = 32 chunks of 16B (4 scales each).
-    if (threadIdx.x < 32) {
-      const int t4 = threadIdx.x * 4;
-      const long pos = (long)blk * kBlkKV + t4;
-      const bool ok = pos + 3 < seq_len;  // partial tails masked in softmax
-      const long g = (kv_base + (ok ? pos : 0)) * heads_kv + (long)kv_head;
-      // scales are (total, Hkv): 4 consecutive tokens are strided by Hkv.
-      #pragma unroll
-      for (int e = 0; e < 4; ++e) {
-        const long p_e = pos + e;
-        const bool ok_e = p_e < seq_len;
-        smem.ksc[buf][t4 + e] = 0.f;  // overwritten below when valid
-        (void)g;
-        if (ok_e) smem.ksc[buf][t4 + e] = kscale[(kv_base + p_e) * heads_kv + kv_head];
-      }
-      (void)ok;
-    }
   };
   const long total_kv = (long)batch * seq_len;
   auto issue_v = [&](int blk) {
@@ -261,7 +247,6 @@ qstat_fwd_fp8v2_kernel(
     __syncthreads();
 
     const unsigned char* kb = smem.k8[buf];
-    const float* ksc = smem.ksc[buf];
 
     // S = Q @ K^T in e4m3: 4 k-chunks of 32 dims (vs 8 chunks of 16 in bf16).
     float s_acc[kBlkKV / 8][4];
@@ -298,7 +283,8 @@ qstat_fwd_fp8v2_kernel(
           const long pos = (long)blk * kBlkKV + tok;
           float& sv = s_acc[n][r * 2 + e];
           const bool vis = tv && pos < seq_len && pos <= t;
-          sv = vis ? sv * qs * ksc[tok] : -1e30f;
+          const float ks = vis ? __ldg(&kscale[(kv_base + pos) * heads_kv + kv_head]) : 0.f;
+          sv = vis ? sv * qs * ks : -1e30f;
           row_max[r] = fmaxf(row_max[r], sv);
         }
       }
@@ -436,8 +422,10 @@ torch::Tensor qstat_fwd_fp8v2(
   TORCH_CHECK(block_t * (heads_q / heads_kv) == kMRows, "block_t * g must be 64");
   #define DISPATCH(BT) \
     if (block_t == BT) { \
-      cudaFuncSetAttribute(qstat_fwd_fp8v2_kernel<BT>, \
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+      if (smem > 48 * 1024) { \
+        cudaFuncSetAttribute(qstat_fwd_fp8v2_kernel<BT>, \
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem); \
+      } \
       qstat_fwd_fp8v2_kernel<BT><<<grid, block, smem, stream>>>( \
           reinterpret_cast<const bf16*>(q.data_ptr()), \
           k8.data_ptr<unsigned char>(), \
