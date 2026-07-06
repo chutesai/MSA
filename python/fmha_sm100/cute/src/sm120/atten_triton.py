@@ -182,7 +182,7 @@ def _sparse_attn_dense_bf16_kernel(
     tl.store(out + (q_idx * head_q + q_head) * dim + offs_d, out_vec, mask=d_mask)
     tl.store(
         lse_out + q_idx * head_q + q_head,
-        tl.where(has_value, tl.log(l_i) + m_i, -float("inf")),
+        tl.where(has_value, tl.log(l_i) + m_i, -30000.0),  # finite empty-row sentinel
     )
 
 
@@ -297,7 +297,7 @@ def _sparse_attn_dense_nvfp4_kernel(
     tl.store(out + (q_idx * head_q + q_head) * dim + offs_d, out_vec, mask=d_mask)
     tl.store(
         lse_out + q_idx * head_q + q_head,
-        tl.where(has_value, tl.log(l_i) + m_i, -float("inf")),
+        tl.where(has_value, tl.log(l_i) + m_i, -30000.0),  # finite empty-row sentinel
     )
 
 
@@ -521,7 +521,7 @@ def _sparse_attn_combine_kernel(
     )
     tl.store(
         lse_out + q_global * head_q + q_head,
-        tl.where(has_value, tl.log(denom) + m, -float("inf")),
+        tl.where(has_value, tl.log(denom) + m, -30000.0),  # finite empty-row sentinel
         mask=q_valid,
     )
 
@@ -673,7 +673,7 @@ def _sparse_attn_lse_combine_kernel(
     has_value = denom > 0.0
     tl.store(
         lse_out + offs_m * head_q + q_head,
-        tl.where(has_value, tl.log(denom) + m, -float("inf")),
+        tl.where(has_value, tl.log(denom) + m, -30000.0),  # finite empty-row sentinel
         mask=q_valid,
     )
 
@@ -783,7 +783,7 @@ def _sparse_attn_csr_accum_bf16_kernel(
     scores = tl.where(q_valid[:, None] & token_valid, scores, -float("inf"))
     final_lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
     p = tl.exp(scores - final_lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid, p, 0.0)
+    p = tl.where(q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
     v_tile = tl.load(v_ptrs, mask=kv_valid[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
     contrib = tl.dot(p, v_tile, out_dtype=tl.float32)
     acc_ptrs = acc_out + (q_global[:, None] * head_q + q_head) * dim + offs_d[None, :]
@@ -1015,7 +1015,7 @@ def _sparse_attn_csr_accum_nvfp4_kernel(
     scores = tl.where(q_valid[:, None] & token_valid, scores, -float("inf"))
     final_lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
     p = tl.exp(scores - final_lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid, p, 0.0)
+    p = tl.where(q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
 
     v_byte = tl.load(v_byte_ptrs, mask=kv_valid[:, None] & d_mask[None, :], other=0)
     use_hi_v = (offs_d & 1) != 0
@@ -1262,7 +1262,7 @@ def _sparse_attn_csr_accum_fp8_kernel(
     scores = tl.where(q_valid[:, None] & token_valid, scores, -float("inf"))
     final_lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
     p = tl.exp(scores - final_lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid, p, 0.0)
+    p = tl.where(q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
     v_tile = tl.load(v_ptrs, mask=kv_valid[:, None] & d_mask[None, :], other=0).to(tl.uint8)
     contrib = tl.dot_scaled(
         p.to(tl.bfloat16),
@@ -1360,7 +1360,7 @@ def _sparse_attn_bwd_row_bf16_kernel(
     do_vec = tl.load(dout + (q_idx * head_q + q_head) * dim + offs_d, mask=d_mask, other=0.0).to(tl.float32)
     out_vec = tl.load(out + (q_idx * head_q + q_head) * dim + offs_d, mask=d_mask, other=0.0).to(tl.float32)
     lse = tl.load(lse_out + q_idx * head_q + q_head)
-    has_row = lse > -float("inf")
+    has_row = lse > -1.0e4  # sentinel-aware
     do_dot_o = tl.sum(do_vec * out_vec, axis=0)
     dq_acc = tl.zeros((128,), dtype=tl.float32)
 
@@ -1512,7 +1512,7 @@ def _sparse_attn_bwd_csr_bf16_kernel(
 
     lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
     p = tl.exp(scores - lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid, p, 0.0)
+    p = tl.where(q_valid[:, None] & token_valid & (lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
 
     v_dp = tl.load(v_ptrs_dp, mask=kv_valid[None, :] & d_mask[:, None], other=0.0)
     dp = tl.dot(do_tile, v_dp, out_dtype=tl.float32)
@@ -1651,7 +1651,7 @@ def _sparse_attn_bwd_csr_fp8_kernel(
 
     lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
     p = tl.exp(scores - lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid, p, 0.0)
+    p = tl.where(q_valid[:, None] & token_valid & (lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
 
     v_dp = tl.load(v_ptrs_dp, mask=kv_valid[None, :] & d_mask[:, None], other=0).to(tl.uint8)
     dp = tl.dot_scaled(
@@ -1816,7 +1816,7 @@ def _sparse_attn_bwd_csr_nvfp4_kernel(
 
     final_lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
     p = tl.exp(scores - final_lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid, p, 0.0)
+    p = tl.where(q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
 
     v_byte_dp = tl.load(v_byte_ptrs_dp, mask=d_mask[:, None] & kv_valid[None, :], other=0)
     v_nib_dp = tl.where(use_hi[:, None], v_byte_dp >> 4, v_byte_dp & 15)
@@ -3557,7 +3557,7 @@ def _sparse_decode_paged_fp8_kernel(
     tl.store(out + (q_idx * head_q + q_head) * dim + offs_d, out_vec, mask=d_mask)
     tl.store(
         lse_out + q_idx * head_q + q_head,
-        tl.where(has_value, tl.log(l_i) + m_i, -float("inf")),
+        tl.where(has_value, tl.log(l_i) + m_i, -30000.0),  # finite empty-row sentinel
     )
 
 
@@ -3652,7 +3652,7 @@ def _sparse_decode_paged_fp8_split_kernel(
     )
     tl.store(
         lse_partial + (split_idx * total_q + q_idx) * head_q + q_head,
-        tl.where(has_value, tl.log(l_i) + m_i, -float("inf")),
+        tl.where(has_value, tl.log(l_i) + m_i, -30000.0),  # finite empty-row sentinel
     )
 
 
@@ -3696,7 +3696,7 @@ def _sparse_decode_split_combine_kernel(
     tl.store(out + (q_idx * head_q + q_head) * dim + offs_d, out_vec, mask=d_mask)
     tl.store(
         lse_out + q_idx * head_q + q_head,
-        tl.where(has_value, tl.log(denom) + m, -float("inf")),
+        tl.where(has_value, tl.log(denom) + m, -30000.0),  # finite empty-row sentinel
     )
 
 

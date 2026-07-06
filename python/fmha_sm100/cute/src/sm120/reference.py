@@ -242,7 +242,7 @@ def sparse_attention_csr_varlen_torch(
 
             if not k_parts:
                 head_out.append(torch.zeros(dim, dtype=torch.float32, device=q.device))
-                neg_inf = torch.full((), float("-inf"), dtype=torch.float32, device=q.device)
+                neg_inf = torch.full((), -30000.0, dtype=torch.float32, device=q.device)  # finite empty-row sentinel (matches the kernels)
                 head_lse.append(neg_inf)
                 if return_temperature_lse:
                     head_temp_lse.append(neg_inf)
@@ -256,7 +256,7 @@ def sparse_attention_csr_varlen_torch(
             finite = torch.isfinite(logits)
             if not bool(finite.any().detach().cpu().item()):
                 head_out.append(torch.zeros(dim, dtype=torch.float32, device=q.device))
-                neg_inf = torch.full((), float("-inf"), dtype=torch.float32, device=q.device)
+                neg_inf = torch.full((), -30000.0, dtype=torch.float32, device=q.device)  # finite empty-row sentinel (matches the kernels)
                 head_lse.append(neg_inf)
                 if return_temperature_lse:
                     head_temp_lse.append(neg_inf)

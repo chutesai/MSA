@@ -391,7 +391,9 @@ qstat_fwd_fp8v2_kernel(
       }
     }
     if ((lane & 3) == 0)
-      lse[gt * heads_q + h] = l_i[r] > 0.f ? m_i[r] + __logf(l_i[r]) : -INFINITY;
+      lse[gt * heads_q + h] =
+          l_i[r] > 0.f ? m_i[r] + __logf(l_i[r])
+                       : -30000.f;  // finite empty-row sentinel (see qstat.py)
   }
 }
 

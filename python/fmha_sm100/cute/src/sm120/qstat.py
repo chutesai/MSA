@@ -263,7 +263,11 @@ def _qstat_fwd_kernel(
     o = acc / safe_l[:, None]
     o_ptrs = out + (gt_m[:, None] * head_q + qh_m[:, None]) * DIM + offs_d[None, :]
     tl.store(o_ptrs, o.to(out.dtype.element_ty), mask=tok_valid[:, None])
-    lse = tl.where(l_i > 0.0, m_i + tl.log(safe_l), -float("inf"))
+    # Empty rows (no selected blocks) emit a FINITE sentinel instead of
+    # -inf: downstream lse consumers (branch merges, z-loss, logging)
+    # stay finite, and exp(sentinel - x) underflows to exactly 0 so
+    # merge weights are unchanged. Backward guards key on > -1e4.
+    lse = tl.where(l_i > 0.0, m_i + tl.log(safe_l), -30000.0)
     tl.store(lse_out + gt_m * head_q + qh_m, lse, mask=tok_valid)
 
 
@@ -358,7 +362,7 @@ def _qstat_bwd_dq_kernel(
     do_tile = do_raw.to(tl.bfloat16)
     lse_m = tl.load(lse_in + gt_m * head_q + qh_m, mask=tok_valid, other=-float("inf"))
     dl_m = tl.load(delta + gt_m * head_q + qh_m, mask=tok_valid, other=0.0)
-    lse_finite = lse_m > -1.0e37
+    lse_finite = lse_m > -1.0e4  # sentinel-aware (empty rows = -30000)
     lse_safe = tl.where(lse_finite, lse_m, 0.0)
 
     if KV_FP8:
@@ -545,7 +549,7 @@ def _qstat_bwd_dkdv_kernel(
             lse_in + q_global * head_q + qh_m, mask=q_valid, other=-float("inf")
         )
         dl_m = tl.load(delta + q_global * head_q + qh_m, mask=q_valid, other=0.0)
-        lse_finite = lse_m > -1.0e37
+        lse_finite = lse_m > -1.0e4  # sentinel-aware (empty rows = -30000)
         lse_safe = tl.where(lse_finite, lse_m, 0.0)
 
         if KV_FP8:
