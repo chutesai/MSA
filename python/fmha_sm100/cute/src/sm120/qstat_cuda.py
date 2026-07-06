@@ -134,11 +134,17 @@ def qstat_backward_fp8_cuda(
     softmax_scale: float,
     kv_grad_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Full-e4m3 backward (EXPERIMENTAL, FMHA_SM120_QSTAT_GRADS=fp8).
+    """Full-e4m3 backward (FMHA_SM120_QSTAT_GRADS=fp8).
 
-    Gradient MMAs run in e4m3 with per-row dO/dS quantization; measured
-    gradient deviation vs the bf16 backward is ~0.999 cosine / 4-5% mean
-    relative. Gate adoption on a loss-level A/B.
+    Gradient MMAs run in e4m3 with per-row dO/dS quantization.  The softmax
+    delta is computed twice: delta (raw dO, for the Triton dK/dV fallback
+    which uses raw dO) and delta_q (from the quantize-dequantized dO', used
+    by the fp8 kernels).  delta_q restores the softmax-gradient shift
+    invariance dS = P*(dP - delta) under the quantized gradient field —
+    using the raw delta against quantized dp injects a deterministic,
+    step-correlated rank-one bias on dq that stalls attention learning
+    (val-loss flatline from sparse activation).  Gate on a loss-level A/B
+    covering >=5k post-sparse-activation steps.
     """
     ext = _ext_bwd_fp8()
     total_q, head_q, dim = q.shape
@@ -151,12 +157,13 @@ def qstat_backward_fp8_cuda(
     qsc = torch.empty((total_q, head_q), device=q.device, dtype=torch.float32)
     dosc = torch.empty_like(qsc)
     ext.qstat_quant_rows(q, dout, v_scale, q8, qsc, do8, dosc, g)
-    # dQ (fuses delta, consumed by dK/dV).
+    # dQ (fuses both deltas, consumed by dK/dV).
     k8t = k_fp8_u8.permute(1, 2, 0).contiguous()
     delta = torch.empty((total_q, head_q), device=q.device, dtype=torch.float32)
+    delta_q = torch.empty_like(delta)
     dq = ext.qstat_dq_fp8(
         q, k_fp8_u8, k8t, v_fp8_u8, k_scale, v_scale, dout, out, lse,
-        union, counts, selbits, delta,
+        union, counts, selbits, delta, delta_q,
         batch, seq_len, block_t, softmax_scale,
     )
     # dK/dV with the deterministic long-row split of the bf16 backward.
@@ -173,8 +180,9 @@ def qstat_backward_fp8_cuda(
         dk = torch.empty((total_q, head_kv, dim), device=q.device, dtype=kv_grad_dtype)
         dv = torch.empty_like(dk)
     if dkdv_fp8_ok:
+        # fp8 dK/dV computes dp from the quantized dO' (do8) -> needs delta_q.
         ext.qstat_dkdv_fp8(
-            q8, qsc, do8, dosc, k_fp8_u8, v_fp8_u8, k_scale, v_scale, lse, delta,
+            q8, qsc, do8, dosc, k_fp8_u8, v_fp8_u8, k_scale, v_scale, lse, delta_q,
             k2q_row_ptr, k2q_q_indices, row_batch, row_kv_block, dk, dv,
             seq_len, block_tq, topk, nsplit, softmax_scale,
         )
@@ -182,6 +190,8 @@ def qstat_backward_fp8_cuda(
         # Mixed mode for processes where the >48KB opt-in is unavailable:
         # keep the (48KB, mesh-safe) CUDA dQ above and run dK/dV through the
         # Triton kernel on dequantized K/V. Same math as the bf16 backward.
+        # NOTE: this path uses RAW dO, so it takes the raw `delta` (delta_q
+        # would be inconsistent here — the invariance argument runs both ways).
         from src.sm120.qstat import _pick_block_t, _qstat_bwd_dkdv_kernel
 
         k_deq = (

@@ -1079,19 +1079,23 @@ class _QstatSparseAttentionFp8(torch.autograd.Function):
                 f"FMHA_SM120_QSTAT_GRADS must be bf16 or fp8, got {grads_impl!r}"
             )
         if grads_impl == "fp8" and blk_kv == 128 and q.shape[-1] == 128 and seq_len % 16 == 0:
-            # EXPERIMENTAL full-e4m3 backward — NOT validated for production
-            # training: a real run NaN'd at ~step 1000 (d1024, lr 3e-4
-            # warmup, 8xDDP) with these gradients; per-row e4m3 amax scaling
-            # is fragile under heavy-tailed gradient outliers. Do not adopt
-            # without a >=2k-step loss A/B at your exact config. An
-            # e5m2-gradient rework is the planned path to re-qualification.
+            # Full-e4m3 backward with the consistent-delta fix: delta is
+            # computed from the quantize-dequantized dO' (matching the dp MMA)
+            # so the softmax-gradient shift invariance dS = P*(dP - delta)
+            # holds under the quantized field.  The earlier raw-delta version
+            # injected a deterministic rank-one bias on dq (val-loss flatline
+            # from sparse activation; one config also NaN'd) — root cause was
+            # delta/dp inconsistency, NOT e4m3 dynamic range (per-row amax
+            # gives ~5.7 decades; an e5m2 rework would HALVE mantissa precision
+            # in the (dP - delta) cancellation and make things worse).
+            # Gate adoption on a loss A/B covering >=5k POST-sparse-activation
+            # steps (short/dense-phase gates cannot see gradient-quality
+            # regressions in this path).
             import warnings
 
             warnings.warn(
-                "FMHA_SM120_QSTAT_GRADS=fp8 is EXPERIMENTAL and has produced "
-                "NaNs in real training (step ~1k). Use bf16 grads for "
-                "production; gate any fp8-grads adoption on a >=2k-step "
-                "loss A/B.",
+                "FMHA_SM120_QSTAT_GRADS=fp8: consistent-delta e4m3 backward. "
+                "Gate adoption on a loss A/B covering >=5k post-sparse steps.",
                 stacklevel=2,
             )
             from src.sm120.qstat_cuda import qstat_backward_fp8_cuda

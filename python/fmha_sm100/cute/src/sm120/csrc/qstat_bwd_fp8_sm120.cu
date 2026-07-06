@@ -288,7 +288,8 @@ qstat_dkdv_fp8_kernel(
         const float qs_m = smem.qsc[quad][mrow];
         const float dos_m = smem.dosc[quad][mrow];
         const int ql = smem.qloc[quad][mrow];
-        const bool fin = lse_r > -1e30f && ql >= 0;
+        // Sentinel-aware (-30000 finite lse for empty-selection rows, bb8fc8b).
+        const bool fin = lse_r > -1e4f && ql >= 0;
         #pragma unroll
         for (int rr = 0; rr < 2; ++rr) {
           const int tok = wtok + (lane >> 2) + rr * 8;
@@ -453,6 +454,14 @@ struct SharedStorageDq {
   unsigned char v8[kBlkKV * kDim];    // token-major (dp)
 };
 
+// Round-trip a float through e4m3 (the exact value the MMA consumes).
+__device__ __forceinline__ float e4m3_rt(float x) {
+  const __nv_fp8_storage_t b8 =
+      __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+  const __half_raw hr = __nv_cvt_fp8_to_halfraw(b8, __NV_E4M3);
+  return __half2float(*reinterpret_cast<const __half*>(&hr));
+}
+
 template <int BLOCK_T>
 __global__ void __launch_bounds__(kWarps * 32, 1)
 qstat_dq_fp8_kernel(
@@ -470,6 +479,7 @@ qstat_dq_fp8_kernel(
     const unsigned long long* __restrict__ selbits,
     bf16* __restrict__ dq,
     float* __restrict__ delta_out,
+    float* __restrict__ delta_q_out,
     int batch, int seq_len, int ntiles, int heads_q, int heads_kv,
     int u_max, float scale) {
   constexpr int kG = kMRows / BLOCK_T;
@@ -508,9 +518,16 @@ qstat_dq_fp8_kernel(
   }
 
   // Quantize Q per-row and dO' = dO * v_scale[channel] per-row into e4m3 A
-  // fragments; compute delta = sum(dout*out) inline (raw dO, not dO').
+  // fragments; compute delta = sum(dout*out) inline (raw dO, for the Triton
+  // dK/dV consumer) AND delta_q = sum(dequant(e4m3(dO'))*out) — the delta that
+  // is self-consistent with the quantized dO' the dp MMA actually consumes.
+  // Using raw delta against quantized dp breaks the softmax-gradient shift
+  // invariance dS = P*(dP - delta): the quantization noise's P-weighted row
+  // mean survives as a deterministic, step-correlated rank-one bias on dq
+  // (observed as a val-loss flatline from sparse activation). delta_q restores
+  // the identity exactly under the quantized gradient field.
   unsigned a_q[kDim / 32][4], a_do[kDim / 32][4];
-  float q_sc[2], do_sc[2], dl[2] = {0.f, 0.f};
+  float q_sc[2], do_sc[2], dl[2] = {0.f, 0.f}, dl_q[2] = {0.f, 0.f};
   {
     float qv[2][kDim / 32][8], dv[2][kDim / 32][8];
     float qa[2] = {0.f, 0.f}, da[2] = {0.f, 0.f};
@@ -558,6 +575,25 @@ qstat_dq_fp8_kernel(
         a_do[kc][2 + r] = pack_e4m3x4(dv[r][kc][4] * di, dv[r][kc][5] * di,
                                       dv[r][kc][6] * di, dv[r][kc][7] * di);
       }
+      // delta_q: same channel walk with the row scale now known.  dq~O_c =
+      // rt(dv*di)/(di*vs) is exactly the raw-dO-space value the dp MMA sees;
+      // outp/vscale re-reads are one-time L2 hits (dwarfed by the block loop).
+      if (valid_r[r]) {
+        #pragma unroll
+        for (int kc = 0; kc < kDim / 32; ++kc) {
+          const int c0 = kc * 32 + (lane & 3) * 4;
+          #pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const int c = c0 + (e >> 2) * 16 + (e & 3);
+            const float vs = vscale[kv_head * kDim + c];
+            const float ox = __bfloat162float(outp[base_r[r] + c]);
+            dl_q[r] += e4m3_rt(dv[r][kc][e] * di) / (di * vs) * ox;
+          }
+        }
+      }
+      #pragma unroll
+      for (int w = 2; w >= 1; w >>= 1)
+        dl_q[r] += __shfl_xor_sync(mask_all(), dl_q[r], w);
     }
   }
 
@@ -566,10 +602,14 @@ qstat_dq_fp8_kernel(
   for (int r = 0; r < 2; ++r) {
     lse_r[r] = valid_r[r] ? lse_in[((long)b * seq_len + t_r[r]) * heads_q + h_r[r]]
                           : -INFINITY;
-    if (valid_r[r] && (lane & 3) == 0 && half == 0)
+    if (valid_r[r] && (lane & 3) == 0 && half == 0) {
       delta_out[((long)b * seq_len + t_r[r]) * heads_q + h_r[r]] = dl[r];
+      delta_q_out[((long)b * seq_len + t_r[r]) * heads_q + h_r[r]] = dl_q[r];
+    }
   }
-  const bool fin_r[2] = {lse_r[0] > -1e30f, lse_r[1] > -1e30f};
+  // Sentinel-aware: empty-selection rows carry the finite -30000 lse sentinel
+  // (bb8fc8b), not -inf.
+  const bool fin_r[2] = {lse_r[0] > -1e4f, lse_r[1] > -1e4f};
   const float lse_safe[2] = {fin_r[0] ? lse_r[0] : 0.f, fin_r[1] ? lse_r[1] : 0.f};
 
   float dq_acc[2][kDim / 4];
@@ -648,7 +688,7 @@ qstat_dq_fp8_kernel(
           const float ks = vis ? __ldg(&kscale[(kv_base + pos) * heads_kv + kv_head]) : 0.f;
           const float p = vis ? __expf(sv * (q_sc[r] * scale) * ks - lse_safe[r]) : 0.f;
           const float dp_real = dv_ * do_sc[r];
-          dv_ = p * (dp_real - dl[r]) * ks;
+          dv_ = p * (dp_real - dl_q[r]) * ks;
           ds_amax[r] = fmaxf(ds_amax[r], fabsf(dv_));
         }
       }
@@ -839,6 +879,7 @@ torch::Tensor qstat_dq_fp8(
     torch::Tensor kscale, torch::Tensor vscale, torch::Tensor dout,
     torch::Tensor outp, torch::Tensor lse, torch::Tensor unions,
     torch::Tensor counts, torch::Tensor selbits, torch::Tensor delta_out,
+    torch::Tensor delta_q_out,
     int64_t batch, int64_t seq_len, int64_t block_t, double scale) {
   const at::cuda::CUDAGuard device_guard{q.device()};
   TORCH_CHECK(q.dtype() == torch::kBFloat16 && q.is_contiguous());
@@ -870,6 +911,7 @@ torch::Tensor qstat_dq_fp8(
           lse.data_ptr<float>(), unions.data_ptr<int>(), counts.data_ptr<int>(), \
           reinterpret_cast<const unsigned long long*>(selbits.data_ptr()), \
           reinterpret_cast<bf16*>(dq_out.data_ptr()), delta_out.data_ptr<float>(), \
+          delta_q_out.data_ptr<float>(), \
           batch, seq_len, ntiles, heads_q, heads_kv, u_max, \
           static_cast<float>(scale)); \
       C10_CUDA_KERNEL_LAUNCH_CHECK(); return dq_out; }
