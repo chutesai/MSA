@@ -1116,20 +1116,24 @@ class _QstatSparseAttentionFp8(torch.autograd.Function):
                 kv_grad_dtype=ctx.kv_grad_dtype,
             )
             return (dq, dk, dv) + (None,) * 12
-        # Dequantize K/V once and run the bf16 backward kernels: the fp8
-        # variants dequantize in registers before every MMA, which costs
-        # ~10% of the train step. Numerics are unchanged — the same bf16
-        # values reach the same kernels either way.
-        k_deq = (
-            k_fp8_u8.view(torch.float8_e4m3fn).float() * k_scale.unsqueeze(-1)
-        ).to(ctx.q_dtype)
-        v_deq = (
-            v_fp8_u8.view(torch.float8_e4m3fn).float() * v_scale.unsqueeze(0)
-        ).to(ctx.q_dtype)
+        # Run the bf16 backward through the kv_fp8=True kernel path so the
+        # backward recomputes scores in the SAME field the forward used:
+        # the kernels requantize Q exactly as the forward did and consume
+        # fp8 K/V with in-register dequant, making p = exp(s - lse)
+        # bit-consistent with the saved LSE.  The previous dequant-once
+        # kv_fp8=False shortcut ("numerics are unchanged") was WRONG: it
+        # evaluated s from raw-bf16 Q x dequantized K against the fp8-field
+        # LSE, so softmax rows no longer summed to 1 and dS = P*(dP - delta)
+        # lost its shift invariance.  The field error grows with logit
+        # magnitude (~2% Q-rounding x |s|) and enters through exp():
+        # measured dq rel-err 2.7e-2 at healthy logits, 7.8 at an 8x
+        # post-merge logit spike, 2e6 at 16x — the drift-regime NaN factory.
+        # The in-register dequant costs ~10% of the backward; correctness
+        # is not negotiable here.
         dq, dk, dv = qstat_backward(
             q,
-            k_deq,
-            v_deq,
+            k_fp8_u8,
+            v_fp8_u8,
             q2k,
             union,
             counts,
@@ -1145,9 +1149,9 @@ class _QstatSparseAttentionFp8(torch.autograd.Function):
             topk=topk,
             blk_kv=blk_kv,
             softmax_scale=ctx.softmax_scale,
-            kv_fp8=False,
-            k_scale=None,
-            v_scale=None,
+            kv_fp8=True,
+            k_scale=k_scale,
+            v_scale=v_scale,
             kv_grad_dtype=ctx.kv_grad_dtype,
         )
         return (dq, dk, dv) + (None,) * 12
