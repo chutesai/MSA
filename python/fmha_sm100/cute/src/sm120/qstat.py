@@ -106,19 +106,33 @@ def build_tile_block_union(
     ).to(torch.int32)
     if not with_selbits:
         return union.contiguous(), counts.contiguous()
-    # Per-token membership over the same scatter indices: (token, block) pairs
-    # are unique within a tile (q2k lists unique blocks per token), so summing
-    # 1 << t equals bitwise OR.  The trash column swallows -1 padding and is
-    # zeroed so sentinel union entries gather empty masks.
-    weights = torch.ones(1, dtype=torch.int64, device=q2k.device) << (
-        torch.arange(block_t * topk, device=q2k.device, dtype=torch.int64) // topk
-    )
+    # Per-token membership bitmask.  Summing 1 << t equals bitwise OR only
+    # while each (token, block) pair appears once; a duplicated block id would
+    # carry into token t+1's bit (dropping t's selection and fabricating
+    # t+1's).  In-repo producers emit unique ascending ids, but external q2k
+    # is untrusted: sort each token's slots and count only first occurrences.
+    # The trash column swallows -1 padding and is zeroed so sentinel union
+    # entries gather empty masks.
+    tok = sel.view(head_kv, batch, ntiles, block_t, topk).long()
+    tok_sorted, _ = tok.sort(dim=-1)
+    keep = torch.ones_like(tok_sorted, dtype=torch.bool)
+    keep[..., 1:] = tok_sorted[..., 1:] != tok_sorted[..., :-1]
+    idx_sorted = torch.where(
+        tok_sorted < 0, torch.full_like(tok_sorted, num_blocks), tok_sorted
+    ).reshape(head_kv, batch, ntiles, block_t * topk)
+    weights = (
+        (
+            torch.ones((), dtype=torch.int64, device=q2k.device)
+            << torch.arange(block_t, device=q2k.device, dtype=torch.int64)
+        ).view(1, 1, 1, block_t, 1)
+        * keep.long()
+    ).reshape(head_kv, batch, ntiles, block_t * topk)
     bits = torch.zeros(
         (head_kv, batch, ntiles, num_blocks + 1),
         dtype=torch.int64,
         device=q2k.device,
     )
-    bits.scatter_add_(-1, idx, weights.expand_as(idx))
+    bits.scatter_add_(-1, idx_sorted, weights)
     bits[..., num_blocks] = 0
     selbits = bits.gather(-1, union.long()).contiguous()
     return union.contiguous(), counts.contiguous(), selbits
@@ -195,7 +209,9 @@ def _qstat_fwd_kernel(
         # backward kernels re-read Q many times, so THEY get a pre-quantized
         # copy instead (built once in qstat_backward with identical math).
         q_f32 = tl.load(q_ptrs, mask=tok_valid[:, None], other=0.0).to(tl.float32)
-        q_amax = tl.maximum(tl.max(tl.abs(q_f32), axis=1), 1e-8)
+        # 1e-6 matches the CUDA-arm clamp (qstat_fwd_fp8_sm120.cu) so both
+        # impls — and the bwd requantization below — quantize identically.
+        q_amax = tl.maximum(tl.max(tl.abs(q_f32), axis=1), 1e-6)
         q_op = (q_f32 * (448.0 / q_amax)[:, None]).to(tl.float8e4nv)
         q_deq = q_amax / 448.0
         v_ch_scale = tl.load(v_scale + kv_head * DIM + offs_d).to(tl.float32)
@@ -367,7 +383,7 @@ def _qstat_bwd_dq_kernel(
 
     if KV_FP8:
         q_f32 = q_tile.to(tl.float32)
-        q_amax = tl.maximum(tl.max(tl.abs(q_f32), axis=1), 1e-8)
+        q_amax = tl.maximum(tl.max(tl.abs(q_f32), axis=1), 1e-6)  # match fwd/CUDA clamp
         q_op = (q_f32 * (448.0 / q_amax)[:, None]).to(tl.float8e4nv)
         q_deq = q_amax / 448.0
         v_ch_scale = tl.load(v_scale + kv_head * DIM + offs_d).to(tl.float32)
@@ -427,7 +443,10 @@ def _qstat_bwd_dq_kernel(
             dp = tl.dot(do_tile, v_bf, out_dtype=tl.float32)
         else:
             dp = tl.dot(do_tile, v_bf, out_dtype=tl.float32)
-        ds = p * (dp - dl_m[:, None])
+        # p is already 0 on sentinel rows, but delta (dl_m) is NaN when the
+        # fwd emitted a NaN out row behind the finite lse sentinel; 0*(dp-NaN)
+        # = NaN would spread that row into dq. Gate the product, not just p.
+        ds = tl.where(mask & lse_finite[:, None], p * (dp - dl_m[:, None]), 0.0)
         dq_acc += tl.dot(ds.to(tl.bfloat16), tl.trans(k_bf), out_dtype=tl.float32)
 
     dq_acc = dq_acc * softmax_scale
@@ -536,7 +555,7 @@ def _qstat_bwd_dkdv_kernel(
             # Requantize Q exactly as the forward kernel did so that
             # p = exp(s - lse) uses the same scores the saved LSE normalizes.
             q_f32 = tl.load(q_ptrs, mask=q_valid[:, None], other=0.0).to(tl.float32)
-            q_amax = tl.maximum(tl.max(tl.abs(q_f32), axis=1), 1e-8)
+            q_amax = tl.maximum(tl.max(tl.abs(q_f32), axis=1), 1e-6)  # match fwd/CUDA clamp
             q_f8 = (q_f32 * (448.0 / q_amax)[:, None]).to(tl.float8e4nv)
             q_deq = q_amax / 448.0
             q_m = (q_f8.to(tl.float32) * q_deq[:, None]).to(tl.bfloat16)
@@ -571,7 +590,9 @@ def _qstat_bwd_dkdv_kernel(
             dp = tl.dot(do_v_q, v_f8, out_dtype=tl.float32) * (dov_amax / 448.0)[:, None]
         else:
             dp = tl.dot(do_m, v_dn, out_dtype=tl.float32)
-        ds = p * (dp - dl_m[:, None])
+        # See the dq kernel: gate the product so a NaN delta from a poisoned
+        # row (finite sentinel lse, NaN out) cannot leak through 0*NaN.
+        ds = tl.where(mask & lse_finite[:, None], p * (dp - dl_m[:, None]), 0.0)
         ds_bf = ds.to(tl.bfloat16)
         dk_acc += tl.dot(tl.trans(ds_bf), q_m, out_dtype=tl.float32)
 
@@ -738,6 +759,20 @@ def qstat_backward(
     # gather/memory-bound, so extra quantization work outweighs the 2x MMA
     # rate); kept as an experimental probe only.
     grad_fp8 = kv_fp8 and os.environ.get("FMHA_SM120_QSTAT_FP8_BWD", "0") == "1"
+    if grad_fp8:
+        # The GRAD_FP8 kernels compute dp from e4m3-quantized dO·v_scale;
+        # pairing that quantized dp with the raw delta re-introduces the
+        # step-correlated rank-one dq bias fixed for the CUDA backward in
+        # 7d8709e. Recompute delta with dO round-tripped through the exact
+        # same quantization the kernels apply (per-row amax over dO·vs,
+        # clamp 1e-8, x*448/amax -> e4m3 -> x*amax/448).
+        vs = v_scale.repeat_interleave(head_q // head_kv, dim=0)  # (head_q, DIM)
+        do_v = dout.float() * vs.unsqueeze(0)
+        dov_amax = do_v.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        do_rt = (do_v * (448.0 / dov_amax)).to(torch.float8_e4m3fn).float() * (
+            dov_amax / 448.0
+        )
+        delta = ((do_rt / vs.unsqueeze(0)) * out.float()).sum(dim=-1)
 
     # dK/dV work per program is proportional to its CSR row length, and an
     # attention-sink block's row can hold every query in the batch, leaving a
@@ -1422,7 +1457,10 @@ def _decode_paged_v2_kernel(
         scores = tl.sum(k_tile * q_vec[:, None], axis=0) * softmax_scale
         scores = tl.where(token_valid, scores, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(scores, axis=0))
-        alpha = tl.exp(m_i - m_new)
+        # exp(-inf - -inf) = NaN while no valid token has been seen (leading
+        # invalid slot); acc/l_i are still 0 then, so alpha=1 keeps them 0
+        # instead of permanently poisoning the row.
+        alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
         p = tl.exp(scores - m_new)
         p = tl.where(token_valid, p, 0.0)
         if quantize_p_fp8:
@@ -1465,6 +1503,9 @@ def _decode_paged_v2_kernel(
     has_value = l_i > 0.0
     safe_l = tl.where(has_value, l_i, 1.0)
     out_vec = tl.where(has_value, acc / safe_l, 0.0)
+    # Split-K PARTIALs keep -inf by design (the combiner gates on it); a
+    # FINAL store uses the finite empty-row sentinel like every other
+    # post-bb8fc8b final-lse producer.
     lse_val = tl.where(has_value, tl.log(l_i) + m_i, -float("inf"))
     if WRITE_PARTIAL:
         tl.store(
@@ -1475,7 +1516,10 @@ def _decode_paged_v2_kernel(
         tl.store(lse_partial + (split_idx * total_q + q_idx) * head_q + q_head, lse_val)
     else:
         tl.store(out + (q_idx * head_q + q_head) * dim + offs_d, out_vec, mask=d_mask)
-        tl.store(lse_out + q_idx * head_q + q_head, lse_val)
+        tl.store(
+            lse_out + q_idx * head_q + q_head,
+            tl.where(has_value, lse_val, -30000.0),  # finite empty-row sentinel
+        )
 
 
 def sparse_decode_paged_v2(

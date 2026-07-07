@@ -155,7 +155,9 @@ __device__ __forceinline__ int compute_kv_iters(
 __device__ __forceinline__ void add_task(
     PlanSharedState& s, int sm,
     int16_t kv_begin, int16_t kv_end, int16_t unsplit_id, int8_t sub_id) {
-  int idx = s.sm_task_count[sm]++;
+  int idx = s.sm_task_count[sm];
+  if (idx >= MAX_TASKS_PER_SM) return;  // never spill into the next SM's row
+  s.sm_task_count[sm] = idx + 1;
   s.task_kv_begin[sm][idx] = kv_begin;
   s.task_kv_end[sm][idx] = kv_end;
   s.task_unsplit_id[sm][idx] = unsplit_id;
@@ -164,6 +166,9 @@ __device__ __forceinline__ void add_task(
 
 __device__ __forceinline__ bool split_task(
     PlanSharedState& s, int sm, int task_idx, int keep_iters, int target_sm, int max_splits) {
+  // Declining a split is always valid (the task simply stays whole); a full
+  // target row must decline or add_task would drop the moved half.
+  if (s.sm_task_count[target_sm] >= MAX_TASKS_PER_SM) return false;
   int16_t uid = s.task_unsplit_id[sm][task_idx];
 
   int old_count = atomicAdd(&s.unsplit_sub_counter[uid], 1);
@@ -560,6 +565,7 @@ __device__ void phase1_linear_fill(
     int cur_sm = 0;
     int sm_budget = target_budget;
     int min_piece_cost = kTileGlobalOverhead + MIN_ITERS_PER_SPLIT * kPerIterOverhead;
+    int total_tasks = 0;
 
     for (int u = 0; u < n; u++) {
       int tile_iters = s.unsplit_kv_iters[u];
@@ -587,8 +593,14 @@ __device__ void phase1_linear_fill(
         if (max_iters < MIN_ITERS_PER_SPLIT) max_iters = MIN_ITERS_PER_SPLIT;
         if (sub_id + 1 >= max_splits) max_iters = avail;
         int take = avail < max_iters ? avail : max_iters;
+        // Splitting is optional, dropping work is not: once free task slots
+        // barely cover the remaining tiles (one piece each always fits when
+        // n <= capacity), stop splitting so the all-full break stays
+        // unreachable.
+        if (num_buckets * MAX_TASKS_PER_SM - total_tasks <= n - u) take = avail;
 
         add_task(s, cur_sm, tile_pos, tile_pos + take, u, sub_id++);
+        ++total_tasks;
         int piece_cost = kPerIterOverhead * take + kTileGlobalOverhead;
         s.sm_cost[cur_sm] += piece_cost;
         sm_budget -= piece_cost;
@@ -696,7 +708,7 @@ __device__ void phase2_rebalance(
           }
         }
 
-        if (best_move >= 0) {
+        if (best_move >= 0 && s.sm_task_count[min_sm] < MAX_TASKS_PER_SM) {
           // Move entire task
           int16_t kb = s.task_kv_begin[max_sm][best_move];
           int16_t ke = s.task_kv_end[max_sm][best_move];
@@ -822,7 +834,7 @@ __device__ void phase2_rebalance_parallel(
         }
       }
 
-      if (best_move >= 0) {
+      if (best_move >= 0 && s.sm_task_count[target_sm] < MAX_TASKS_PER_SM) {
         int16_t kb = s.task_kv_begin[sm][best_move];
         int16_t ke = s.task_kv_end[sm][best_move];
         int16_t uid = s.task_unsplit_id[sm][best_move];

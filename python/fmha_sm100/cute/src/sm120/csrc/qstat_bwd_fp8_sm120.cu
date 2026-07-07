@@ -301,7 +301,10 @@ qstat_dkdv_fp8_kernel(
               ? __expf(sv * (ks_r[rr] * qs_m * scale) - (fin ? lse_r : 0.f)) : 0.f;
           const float dp_real = dv_ * dos_m;
           sv = p * dos_m;                       // pT'
-          dv_ = p * (dp_real - dl_r) * qs_m;    // dsT'
+          // Gate the product too: delta (dl_r) is NaN when the fwd emitted a
+          // NaN out row behind the finite lse sentinel; 0*(dp-NaN)=NaN would
+          // spread that row into dK/dV.
+          dv_ = vis ? p * (dp_real - dl_r) * qs_m : 0.f;  // dsT'
           p_amax[rr] = fmaxf(p_amax[rr], fabsf(sv));
           ds_amax[rr] = fmaxf(ds_amax[rr], fabsf(dv_));
         }

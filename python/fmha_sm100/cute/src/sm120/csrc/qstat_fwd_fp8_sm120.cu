@@ -2,9 +2,9 @@
 // SM120 qstat forward, FP8 score-dots: S = Q@K^T via mma.sync m16n8k32
 // e4m3 (2x the bf16 mma rate), matching the repo qstat_fp8 contract:
 // Q quantized per-row to e4m3 in-kernel, K pre-quantized e4m3 with per-token
-// scales, all scales applied outside the MMA. PV stays bf16 (more precise
-// than the Triton fp8 path, which also quantizes P). K ring shrinks to
-// 2x16KB; V bf16 32KB; ~65KB shared memory total.
+// scales, all scales applied outside the MMA. The v2 kernel quantizes P to
+// e4m3 and runs e4m3 PV MMAs (same P handling as the Triton fp8 path).
+// K ring shrinks to 2x16KB; ~65KB shared memory total.
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>

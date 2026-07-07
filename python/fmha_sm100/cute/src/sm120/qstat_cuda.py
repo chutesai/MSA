@@ -189,31 +189,29 @@ def qstat_backward_fp8_cuda(
     else:
         # Mixed mode for processes where the >48KB opt-in is unavailable:
         # keep the (48KB, mesh-safe) CUDA dQ above and run dK/dV through the
-        # Triton kernel on dequantized K/V. Same math as the bf16 backward.
-        # NOTE: this path uses RAW dO, so it takes the raw `delta` (delta_q
-        # would be inconsistent here — the invariance argument runs both ways).
+        # Triton kernel. The kernel MUST see the raw e4m3 K/V + scales
+        # (KV_FP8=True) so it requantizes Q per row and recomputes p in the
+        # exact score field the saved LSE normalizes — running it on
+        # dequant-once bf16 K/V against the fp8-field LSE is the softmax
+        # field mismatch 53136a0 measured at dq rel-err 7.8 (8x post-merge
+        # logit spike) to 2e6 (16x). dp comes from raw dO (GRAD_FP8=False),
+        # so the raw `delta` pairs correctly, same as the deployed
+        # GRADS=bf16 backward.
         from src.sm120.qstat import _pick_block_t, _qstat_bwd_dkdv_kernel
 
-        k_deq = (
-            k_fp8_u8.view(torch.float8_e4m3fn).float() * k_scale.unsqueeze(-1)
-        ).to(q.dtype)
-        v_deq = (
-            v_fp8_u8.view(torch.float8_e4m3fn).float() * v_scale.unsqueeze(0)
-        ).to(q.dtype)
         total_rows = row_batch.shape[0]
         sub_n = 64
         nsub = 128 // sub_n
         grad_split_stride = (
             total_q * head_kv * dim if nsplit > 1 else 0
         )
-        dummy = torch.empty(0, device=q.device, dtype=torch.float32)
         grid_dkdv = (total_rows * nsub, head_kv, nsplit)
         _qstat_bwd_dkdv_kernel[grid_dkdv](
-            q, k_deq, v_deq, k2q_row_ptr, k2q_q_indices, row_batch,
-            row_kv_block, dummy, dummy, lse, delta, dout, dk, dv,
+            q, k_fp8_u8, v_fp8_u8, k2q_row_ptr, k2q_q_indices, row_batch,
+            row_kv_block, k_scale, v_scale, lse, delta, dout, dk, dv,
             int(grad_split_stride), float(softmax_scale), int(total_q),
             int(total_rows), int(seq_len), int(head_q), int(head_kv),
-            int(g), int(topk), False, False,
+            int(g), int(topk), True, False,
             NSPLIT=int(nsplit), BLOCK_TQ=int(block_tq), BLK_KV=128,
             SUB_N=int(sub_n), DIM=int(dim), num_warps=8, num_stages=2,
         )

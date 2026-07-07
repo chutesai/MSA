@@ -93,16 +93,14 @@ def _kv_slice_dense(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    batch_idx: int,
+    k_start: int,
+    k_len: int,
     kv_head: int,
     kv_block: int,
     blk_kv: int,
-    cu_seqlens_k: list[int],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    k_start = cu_seqlens_k[batch_idx]
-    k_end = cu_seqlens_k[batch_idx + 1]
     local_start = kv_block * blk_kv
-    local_end = min(local_start + blk_kv, k_end - k_start)
+    local_end = min(local_start + blk_kv, k_len)
     if local_start >= local_end:
         empty = torch.empty(0, k.shape[-1], device=k.device, dtype=k.dtype)
         pos = torch.empty(0, device=k.device, dtype=torch.int32)
@@ -122,9 +120,8 @@ def _kv_slice_paged(
     kv_head: int,
     kv_block: int,
     blk_kv: int,
-    cu_seqlens_k: list[int],
+    k_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    k_len = cu_seqlens_k[batch_idx + 1] - cu_seqlens_k[batch_idx]
     local_start = kv_block * blk_kv
     local_end = min(local_start + blk_kv, k_len)
     if local_start >= local_end:
@@ -165,14 +162,19 @@ def sparse_attention_csr_varlen_torch(
         raise ValueError("q.shape[1] must be divisible by head_kv")
     if dim != 128:
         raise ValueError(f"SM120 reference currently expects D=128, got {dim}")
+    # cu_k keeps the ORIGINAL batch starts; effective lengths live in k_lens.
+    # (Folding start_b + used_b into one prefix list only works when every
+    # predecessor batch is fully used — otherwise batch b inherits its
+    # predecessors' slack as extra causal window and, in dense mode, reads
+    # the previous batch's tokens.)
+    cu_k = _to_int_list(cu_seqlens_k)
     if seqused_k is not None:
-        # The SM100 public API supports paged effective lengths.  Keep the
-        # fallback strict until a fused path handles this without host logic.
-        cu_k = _to_int_list(cu_seqlens_k)
         used = _to_int_list(seqused_k)
-        cu_k = [cu_k[0]] + [cu_k[i] + used[i] for i in range(len(used))]
+        if len(used) != len(cu_k) - 1:
+            raise ValueError("seqused_k must have one entry per batch")
+        k_lens = [int(u) for u in used]
     else:
-        cu_k = _to_int_list(cu_seqlens_k)
+        k_lens = [cu_k[i + 1] - cu_k[i] for i in range(len(cu_k) - 1)]
 
     q2k = (
         q2k_indices.contiguous()
@@ -187,10 +189,25 @@ def sparse_attention_csr_varlen_torch(
             total_q=total_q,
         )
     )
+    if q2k.shape[0] != head_kv or q2k.shape[1] != total_q:
+        raise ValueError(
+            f"q2k_indices must be [head_kv={head_kv}, total_q={total_q}, topk],"
+            f" got {tuple(q2k.shape)} (per-Q-head selections need GQA"
+            " reduction before the attention consumer)"
+        )
     q_lookup = _query_batch_lookup(cu_seqlens_q)
     qhead_per_kv = head_q // head_kv
     scale = float(softmax_scale) if softmax_scale is not None else (dim ** -0.5)
     temp_inv = 1.0 / float(lse_temperature_scale)
+
+    if total_q == 0:
+        out = torch.zeros(0, head_q, dim, dtype=torch.bfloat16, device=q.device)
+        lse_out = torch.zeros(0, head_q, dtype=torch.float32, device=q.device)
+        if return_softmax_lse:
+            if return_temperature_lse:
+                return out, lse_out, lse_out.clone()
+            return out, lse_out
+        return out
 
     out_rows: list[torch.Tensor] = []
     lse_rows: list[torch.Tensor] = []
@@ -202,7 +219,7 @@ def sparse_attention_csr_varlen_torch(
         head_lse: list[torch.Tensor] = []
         head_temp_lse: list[torch.Tensor] = []
         q_len = int(cu_seqlens_q[batch_idx + 1].item() - cu_seqlens_q[batch_idx].item())
-        k_len = cu_k[batch_idx + 1] - cu_k[batch_idx]
+        k_len = k_lens[batch_idx]
         causal_limit = q_local + (k_len - q_len)
         for q_head in range(head_q):
             kv_head = q_head // qhead_per_kv
@@ -217,11 +234,11 @@ def sparse_attention_csr_varlen_torch(
                     kk, vv, pos = _kv_slice_dense(
                         k,
                         v,
-                        batch_idx=batch_idx,
+                        k_start=cu_k[batch_idx],
+                        k_len=k_len,
                         kv_head=kv_head,
                         kv_block=kv_block,
                         blk_kv=blk_kv,
-                        cu_seqlens_k=cu_k,
                     )
                 else:
                     kk, vv, pos = _kv_slice_paged(
@@ -232,7 +249,7 @@ def sparse_attention_csr_varlen_torch(
                         kv_head=kv_head,
                         kv_block=kv_block,
                         blk_kv=blk_kv,
-                        cu_seqlens_k=cu_k,
+                        k_len=k_len,
                     )
                 if kk.numel() == 0:
                     continue
@@ -350,7 +367,7 @@ def sparse_decode_paged_fp8_torch(
                     pos_parts.append(torch.arange(start, end, device=q.device, dtype=torch.int32))
                 if not k_parts:
                     out[q_global, q_head, :].zero_()
-                    lse[q_global, q_head] = -float("inf")
+                    lse[q_global, q_head] = -30000.0  # finite empty-row sentinel (matches the kernels)
                     continue
                 k_tokens = torch.cat(k_parts, dim=0)
                 v_tokens = torch.cat(v_parts, dim=0)
@@ -360,7 +377,7 @@ def sparse_decode_paged_fp8_torch(
                 finite = torch.isfinite(logits)
                 if not bool(finite.any().detach().cpu().item()):
                     out[q_global, q_head, :].zero_()
-                    lse[q_global, q_head] = -float("inf")
+                    lse[q_global, q_head] = -30000.0  # finite empty-row sentinel (matches the kernels)
                     continue
                 row_max = torch.max(logits)
                 p = torch.exp(logits - row_max)

@@ -49,6 +49,14 @@ def _compute_cache_base():
     target_arch = _target_cuda_arch()
     if target_arch != "100a":
         suffix += f"_sm{target_arch}"
+    if target_arch == "120":
+        # The plan kernel bakes these into the .so (see nvcc_flags below); a
+        # cached build from a different value would index its shared-memory
+        # state out of bounds at runtime, so they must be part of the key.
+        plan_sms = os.environ.get("FMHA_PLAN_MAX_CTAS", "128")
+        plan_tasks = os.environ.get("FMHA_PLAN_MAX_TASKS_PER_SM", "48")
+        if (plan_sms, plan_tasks) != ("128", "48"):
+            suffix += f"_plan{plan_sms}x{plan_tasks}"
     if suffix:
         base = base.parent / (base.name + suffix)
     return base

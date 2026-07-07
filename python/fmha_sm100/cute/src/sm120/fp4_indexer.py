@@ -285,7 +285,10 @@ def _fp4_indexer_topk_kernel(
     top_i = tl.full([BQ, TOPK], -1, dtype=tl.int32)
     if FORCE_DIAG:
         diag = (offs_q + offset) // _PAGE_C
-        diag_ok = q_valid & (diag >= 0) & (diag < pages_b)
+        # Gate on the NUMERATOR sign: if signed // truncates toward zero,
+        # offs_q + offset in [-127, -1] gives diag == 0 and a diag >= 0 guard
+        # would force block 0 for rows with zero causal visibility.
+        diag_ok = q_valid & ((offs_q + offset) >= 0) & (diag < pages_b)
         top_s = tl.where((offs_t[None, :] == 0) & diag_ok[:, None], float("inf"), top_s)
         top_i = tl.where((offs_t[None, :] == 0) & diag_ok[:, None], diag[:, None].to(tl.int32), top_i)
     if FORCE_BEGIN > 0:

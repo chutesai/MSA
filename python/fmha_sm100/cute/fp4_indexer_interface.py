@@ -1136,24 +1136,39 @@ def fp4_indexer_topk(
     )
     hq, tiles, total_q = scores.shape
     s_t = scores.permute(0, 2, 1)  # [Hq, total_q, tiles]
+    if force_diagonal_blocks or force_begin_blocks:
+        s_t = s_t.clone()
+        q_pos = torch.arange(total_q, device=scores.device)
+        seq_id = torch.bucketize(q_pos, cu_seqlens_q[1:].long(), right=True)
+        k_len = (cu_seqlens_k[seq_id + 1] - cu_seqlens_k[seq_id]).long()
+        pages_b = (k_len + 127) // 128
     if force_diagonal_blocks:
         # per-query local block: q position within its sequence + offset
-        seq_id = torch.bucketize(
-            torch.arange(total_q, device=scores.device),
-            cu_seqlens_q[1:].long(), right=True,
-        )
-        local = torch.arange(total_q, device=scores.device) - cu_seqlens_q[seq_id].long()
-        k_len = (cu_seqlens_k[seq_id + 1] - cu_seqlens_k[seq_id]).long()
+        # (qo_offset overrides the k_len - q_len default, matching the fused
+        # sm120 kernel).
+        local = q_pos - cu_seqlens_q[seq_id].long()
         q_len = (cu_seqlens_q[seq_id + 1] - cu_seqlens_q[seq_id]).long()
-        diag = ((local + (k_len - q_len)).clamp_min(0) // 128)
-        s_t = s_t.clone()
-        s_t[torch.arange(hq)[:, None], torch.arange(total_q)[None, :], diag[None, :]] = float("inf")
+        offset = qo_offset.long()[seq_id] if qo_offset is not None else k_len - q_len
+        rel = local + offset
+        # Rows with zero causal visibility force nothing (the fused kernel's
+        # diag_ok gate), and never a page beyond the sequence's KV range.
+        ok = (rel >= 0) & ((rel // 128) < pages_b)
+        diag = rel.clamp_min(0) // 128
+        s_t[:, q_pos[ok], diag[ok]] = float("inf")
     if force_begin_blocks:
-        s_t = s_t.clone()
-        s_t[..., :force_begin_blocks] = float("inf")
+        # Per-batch guard: never force begin pages beyond a short sequence's
+        # KV range (the fused kernel checks fb < pages_b).
+        fb = torch.arange(force_begin_blocks, device=scores.device)
+        okb = fb[None, :] < pages_b[:, None]
+        qq, bb = torch.nonzero(okb, as_tuple=True)
+        s_t[:, qq, bb] = float("inf")
     vals, idx = s_t.topk(min(topk, tiles), dim=-1)
-    idx = torch.where(torch.isfinite(vals) | torch.isinf(vals), idx.int(), idx.new_full((), -1).int())
-    idx = torch.where(vals == float("-inf"), idx.new_full((), 2 ** 30).int(), idx.int())
+    # -inf (not selectable) AND NaN scores go to the ascending sort's tail
+    # sentinel so the output keeps the "ascending ids, -1 tail" contract
+    # (a NaN mapped to -1 before the sort lands at the FRONT and breaks
+    # first--1-stops consumers).
+    drop = (vals == float("-inf")) | torch.isnan(vals)
+    idx = torch.where(drop, idx.new_full((), 2 ** 30).int(), idx.int())
     idx, _ = idx.sort(dim=-1)
     idx = torch.where(idx >= 2 ** 30, idx.new_full((), -1).int(), idx)
     out = torch.full((hq, total_q, topk), -1, dtype=torch.int32, device=scores.device)

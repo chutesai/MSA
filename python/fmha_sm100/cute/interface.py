@@ -47,6 +47,7 @@ from src.common.tma_utils import (
 )
 
 _compile_cache: dict = {}
+_WARNED_TORCH_REF_AUTOGRAD = False
 _TEMPERATURE_LSE_FAST_PATH_ABS_TOL = 1e-12
 _SUPPORTED_SPARSE_TOPK = (4, 8, 16, 32)
 _SUPPORTED_FWD_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
@@ -1689,6 +1690,11 @@ def _sparse_atten_csr_varlen_forward(
             raise NotImplementedError(
                 "SM120 backend does not emulate FP8 partial quantization"
             )
+        if partial_dtype not in (None, torch.bfloat16):
+            raise NotImplementedError(
+                "SM120 Triton backend reads FMHA_SM120_PARTIAL_DTYPE instead of "
+                f"the partial_dtype argument; got partial_dtype={partial_dtype}"
+            )
         needs_autograd = torch.is_grad_enabled() and (
             q.requires_grad or k.requires_grad or v.requires_grad
         )
@@ -1701,6 +1707,13 @@ def _sparse_atten_csr_varlen_forward(
                     f"FMHA_SM120_BACKWARD must be triton or torch_ref, got {backward_impl!r}"
                 )
             if needs_autograd and not return_softmax_lse and backward_impl == "triton":
+                if seqused_k is not None:
+                    # The autograd wrapper has no seqused_k support; the
+                    # no-grad path raises for it too. Silently attending the
+                    # full cu_seqlens_k ranges would corrupt training.
+                    raise NotImplementedError(
+                        "SM120 Triton autograd path does not support seqused_k"
+                    )
                 from src.sm120.atten_triton import sparse_attention_csr_varlen_triton_autograd
 
                 return sparse_attention_csr_varlen_triton_autograd(
@@ -1747,6 +1760,26 @@ def _sparse_atten_csr_varlen_forward(
             # Autograd that also returns LSE (or FMHA_SM120_BACKWARD=torch_ref)
             # falls through to the differentiable torch reference: the custom
             # Triton backward has no LSE gradient contract.
+            if needs_autograd and backward_impl == "triton":
+                if os.environ.get("FMHA_SM120_TRITON_STRICT", "0") == "1":
+                    raise NotImplementedError(
+                        "SM120: grad-enabled call with return_softmax_lse=True "
+                        "has no Triton backward; refusing to silently switch "
+                        "numerics to the torch reference under "
+                        "FMHA_SM120_TRITON_STRICT=1 (set "
+                        "FMHA_SM120_BACKWARD=torch_ref to opt in explicitly)"
+                    )
+                global _WARNED_TORCH_REF_AUTOGRAD
+                if not _WARNED_TORCH_REF_AUTOGRAD:
+                    _WARNED_TORCH_REF_AUTOGRAD = True
+                    import warnings
+
+                    warnings.warn(
+                        "SM120: grad-enabled call requesting softmax LSE runs "
+                        "the torch reference (different numerics than the "
+                        "Triton kernels used on non-LSE steps)",
+                        stacklevel=2,
+                    )
         from src.sm120.reference import sparse_attention_csr_varlen_torch
 
         return sparse_attention_csr_varlen_torch(

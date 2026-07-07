@@ -43,7 +43,16 @@ def _nvfp4_luts(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         exp = (byte >> 3) & 15
         mant = byte & 7
         mant_f = mant * 0.125
-        value = mant_f * math.exp2(-6.0) if exp == 0 else (1.0 + mant_f) * math.exp2(exp - 7.0)
+        if exp == 15 and mant == 7:
+            # e4m3fn: S.1111.111 is NaN, not (1+0.875)*2^8 = 480. Decoding it
+            # as 480 turns a poisoned scale byte into silent x480 inflation
+            # instead of a detectable NaN (and diverges from torch's
+            # float8_e4m3fn view used by the quantizer/reference).
+            value = float("nan")
+        elif exp == 0:
+            value = mant_f * math.exp2(-6.0)
+        else:
+            value = (1.0 + mant_f) * math.exp2(exp - 7.0)
         fp8_vals.append(-value if sign else value)
 
     cached = (
@@ -77,6 +86,9 @@ def _fp8_e4m3fn_to_f32(byte):
     sub = mant_f * tl.exp2(tl.full(mant.shape, -6.0, tl.float32))
     norm = (1.0 + mant_f) * tl.exp2(exp.to(tl.float32) - 7.0)
     val = tl.where(exp == 0, sub, norm)
+    # e4m3fn: S.1111.111 is NaN (there are no exp-15 normals past 448);
+    # decoding it as 480 would silently inflate by a poisoned scale byte.
+    val = tl.where((exp == 15) & (mant == 7), float("nan"), val)
     return tl.where(sign != 0, -val, val)
 
 
@@ -152,7 +164,11 @@ def _sparse_attn_dense_bf16_kernel(
         if causal:
             valid = valid & (pos <= (q_local + (k_len - q_len)))
         if paged_kv:
-            physical_page = tl.load(page_table + batch_idx * max_pages_per_seq + kv_block)
+            # kv_block is -1 for padding slots; clamp before the (unmasked)
+            # page_table load like the nvfp4 twin — the K/V loads below are
+            # masked by `valid` either way.
+            safe_block = tl.maximum(kv_block, 0)
+            physical_page = tl.load(page_table + batch_idx * max_pages_per_seq + safe_block)
             k_ptrs = k + (((physical_page * head_kv + kv_head) * blk_kv + offs_n[:, None]) * dim + offs_d[None, :])
         else:
             k_tok = k_base + pos
@@ -163,7 +179,10 @@ def _sparse_attn_dense_bf16_kernel(
 
         m_ij = tl.max(scores, axis=0)
         m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new)
+        # exp(-inf - -inf) = NaN while no valid token has been seen (leading
+        # invalid/fully-masked slot); acc/l_i are still 0 then, so alpha=1
+        # keeps them 0 instead of permanently poisoning the row.
+        alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
         p = tl.exp(scores - m_new)
         p = tl.where(valid, p, 0.0)
 
@@ -277,16 +296,26 @@ def _sparse_attn_dense_nvfp4_kernel(
         scale_offsets = _scale_128x4_offset(scale_row[:, None], scale_col[None, :], scale_cols)
         k_scale_byte = tl.load(k_scale + scale_offsets, mask=valid[:, None] & d_mask[None, :], other=0)
         v_scale_byte = tl.load(v_scale + scale_offsets, mask=valid[:, None] & d_mask[None, :], other=0)
-        k_tile = _fp4_e2m1_to_f32(k_nib) * _fp8_e4m3fn_to_f32(k_scale_byte) * kg
+        # Round the dequant to bf16 like the csr/csr_scalar arms and the
+        # backward's inline dequant, so this arm's saved lse is in the same
+        # score field the backward recomputes (p = exp(s - lse)).
+        k_tile = (
+            _fp4_e2m1_to_f32(k_nib) * _fp8_e4m3fn_to_f32(k_scale_byte) * kg
+        ).to(tl.bfloat16).to(tl.float32)
         scores = tl.sum(k_tile * q_vec[None, :], axis=1) * softmax_scale
         scores = tl.where(valid, scores, -float("inf"))
 
         m_ij = tl.max(scores, axis=0)
         m_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_new)
+        # exp(-inf - -inf) = NaN while no valid token has been seen (leading
+        # invalid/fully-masked slot); acc/l_i are still 0 then, so alpha=1
+        # keeps them 0 instead of permanently poisoning the row.
+        alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
         p = tl.exp(scores - m_new)
         p = tl.where(valid, p, 0.0)
-        v_tile = _fp4_e2m1_to_f32(v_nib) * _fp8_e4m3fn_to_f32(v_scale_byte) * vg
+        v_tile = (
+            _fp4_e2m1_to_f32(v_nib) * _fp8_e4m3fn_to_f32(v_scale_byte) * vg
+        ).to(tl.bfloat16).to(tl.float32)
         acc = acc * alpha + tl.sum(p[:, None] * v_tile, axis=0)
         l_i = l_i * alpha + tl.sum(p, axis=0)
         m_i = m_new
@@ -782,8 +811,12 @@ def _sparse_attn_csr_accum_bf16_kernel(
         token_valid = token_valid & (pos[None, :] <= causal_limit[:, None])
     scores = tl.where(q_valid[:, None] & token_valid, scores, -float("inf"))
     final_lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
-    p = tl.exp(scores - final_lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
+    # Gate BEFORE exp (sentinel-aware): masked lanes carry scores=-inf with
+    # lse=-inf (exp(NaN)) and sentinel rows would exp(scores + 30000) to
+    # +inf; gating the exponent keeps every transient finite.
+    p_gate = q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None]
+    lse_safe = tl.where(final_lse > -1.0e4, final_lse, 0.0)
+    p = tl.exp(tl.where(p_gate, scores - lse_safe[:, None], -float("inf")))
     v_tile = tl.load(v_ptrs, mask=kv_valid[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
     contrib = tl.dot(p, v_tile, out_dtype=tl.float32)
     acc_ptrs = acc_out + (q_global[:, None] * head_q + q_head) * dim + offs_d[None, :]
@@ -1014,8 +1047,12 @@ def _sparse_attn_csr_accum_nvfp4_kernel(
         token_valid = token_valid & (pos[None, :] <= causal_limit[:, None])
     scores = tl.where(q_valid[:, None] & token_valid, scores, -float("inf"))
     final_lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
-    p = tl.exp(scores - final_lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
+    # Gate BEFORE exp (sentinel-aware): masked lanes carry scores=-inf with
+    # lse=-inf (exp(NaN)) and sentinel rows would exp(scores + 30000) to
+    # +inf; gating the exponent keeps every transient finite.
+    p_gate = q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None]
+    lse_safe = tl.where(final_lse > -1.0e4, final_lse, 0.0)
+    p = tl.exp(tl.where(p_gate, scores - lse_safe[:, None], -float("inf")))
 
     v_byte = tl.load(v_byte_ptrs, mask=kv_valid[:, None] & d_mask[None, :], other=0)
     use_hi_v = (offs_d & 1) != 0
@@ -1261,8 +1298,12 @@ def _sparse_attn_csr_accum_fp8_kernel(
         token_valid = token_valid & (pos[None, :] <= causal_limit[:, None])
     scores = tl.where(q_valid[:, None] & token_valid, scores, -float("inf"))
     final_lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
-    p = tl.exp(scores - final_lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
+    # Gate BEFORE exp (sentinel-aware): masked lanes carry scores=-inf with
+    # lse=-inf (exp(NaN)) and sentinel rows would exp(scores + 30000) to
+    # +inf; gating the exponent keeps every transient finite.
+    p_gate = q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None]
+    lse_safe = tl.where(final_lse > -1.0e4, final_lse, 0.0)
+    p = tl.exp(tl.where(p_gate, scores - lse_safe[:, None], -float("inf")))
     v_tile = tl.load(v_ptrs, mask=kv_valid[:, None] & d_mask[None, :], other=0).to(tl.uint8)
     contrib = tl.dot_scaled(
         p.to(tl.bfloat16),
@@ -1361,6 +1402,7 @@ def _sparse_attn_bwd_row_bf16_kernel(
     out_vec = tl.load(out + (q_idx * head_q + q_head) * dim + offs_d, mask=d_mask, other=0.0).to(tl.float32)
     lse = tl.load(lse_out + q_idx * head_q + q_head)
     has_row = lse > -1.0e4  # sentinel-aware
+    lse_safe = tl.where(has_row, lse, 0.0)
     do_dot_o = tl.sum(do_vec * out_vec, axis=0)
     dq_acc = tl.zeros((128,), dtype=tl.float32)
 
@@ -1388,8 +1430,9 @@ def _sparse_attn_bwd_row_bf16_kernel(
         k_tile = tl.load(k_ptrs, mask=valid[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
         v_tile = tl.load(v_ptrs, mask=valid[:, None] & d_mask[None, :], other=0.0).to(tl.float32)
         logits = tl.sum(k_tile * q_vec[None, :], axis=1) * softmax_scale
-        p = tl.exp(logits - lse)
-        p = tl.where(valid & has_row, p, 0.0)
+        # Gate BEFORE exp: exp(logits + 30000) on a sentinel row overflows to
+        # +inf (select-zeroed today, but one refactor from leaking).
+        p = tl.exp(tl.where(valid & has_row, logits - lse_safe, -float("inf")))
         dp = tl.sum(v_tile * do_vec[None, :], axis=1)
         ds = p * (dp - do_dot_o)
         dq_acc += tl.sum((ds[:, None] * k_tile), axis=0) * softmax_scale
@@ -1511,12 +1554,18 @@ def _sparse_attn_bwd_csr_bf16_kernel(
     scores = tl.where(q_valid[:, None] & token_valid, scores, -float("inf"))
 
     lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
-    p = tl.exp(scores - lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid & (lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
+    # Gate BEFORE exp (sentinel-aware): masked lanes carry scores=-inf with
+    # lse=-inf (exp(NaN)) and sentinel rows would exp(scores + 30000) to
+    # +inf; gating the exponent keeps every transient finite.
+    p_gate = q_valid[:, None] & token_valid & (lse > -1.0e4)[:, None]
+    lse_safe = tl.where(lse > -1.0e4, lse, 0.0)
+    p = tl.exp(tl.where(p_gate, scores - lse_safe[:, None], -float("inf")))
 
     v_dp = tl.load(v_ptrs_dp, mask=kv_valid[None, :] & d_mask[:, None], other=0.0)
     dp = tl.dot(do_tile, v_dp, out_dtype=tl.float32)
-    do_dot_o = tl.sum(do_tile * out_tile, axis=1)
+    # D must be fp32: bf16 products here bias ds = p*(dp - D) on every lane
+    # of converged rows (dp is fp32; the row-mode kernel already upcasts).
+    do_dot_o = tl.sum(do_tile.to(tl.float32) * out_tile.to(tl.float32), axis=1)
     ds = p * (dp - do_dot_o[:, None])
 
     k_grad = tl.load(k_ptrs_grad, mask=kv_valid[:, None] & d_mask[None, :], other=0.0)
@@ -1650,8 +1699,12 @@ def _sparse_attn_bwd_csr_fp8_kernel(
     scores = tl.where(q_valid[:, None] & token_valid, scores, -float("inf"))
 
     lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
-    p = tl.exp(scores - lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid & (lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
+    # Gate BEFORE exp (sentinel-aware): masked lanes carry scores=-inf with
+    # lse=-inf (exp(NaN)) and sentinel rows would exp(scores + 30000) to
+    # +inf; gating the exponent keeps every transient finite.
+    p_gate = q_valid[:, None] & token_valid & (lse > -1.0e4)[:, None]
+    lse_safe = tl.where(lse > -1.0e4, lse, 0.0)
+    p = tl.exp(tl.where(p_gate, scores - lse_safe[:, None], -float("inf")))
 
     v_dp = tl.load(v_ptrs_dp, mask=kv_valid[None, :] & d_mask[:, None], other=0).to(tl.uint8)
     dp = tl.dot_scaled(
@@ -1663,7 +1716,9 @@ def _sparse_attn_bwd_csr_fp8_kernel(
         "e4m3",
         out_dtype=tl.float32,
     )
-    do_dot_o = tl.sum(do_tile * out_tile, axis=1)
+    # D must be fp32: bf16 products here bias ds = p*(dp - D) on every lane
+    # of converged rows (dp is fp32; the row-mode kernel already upcasts).
+    do_dot_o = tl.sum(do_tile.to(tl.float32) * out_tile.to(tl.float32), axis=1)
     ds = p * (dp - do_dot_o[:, None])
 
     k_grad = tl.load(k_ptrs_grad, mask=kv_valid[:, None] & d_mask[None, :], other=0).to(tl.uint8)
@@ -1815,8 +1870,12 @@ def _sparse_attn_bwd_csr_nvfp4_kernel(
     scores = tl.where(q_valid[:, None] & token_valid, scores, -float("inf"))
 
     final_lse = tl.load(lse_out + q_global * head_q + q_head, mask=q_valid, other=-float("inf"))
-    p = tl.exp(scores - final_lse[:, None])
-    p = tl.where(q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None], p, 0.0)  # sentinel-aware (empty rows)
+    # Gate BEFORE exp (sentinel-aware): masked lanes carry scores=-inf with
+    # lse=-inf (exp(NaN)) and sentinel rows would exp(scores + 30000) to
+    # +inf; gating the exponent keeps every transient finite.
+    p_gate = q_valid[:, None] & token_valid & (final_lse > -1.0e4)[:, None]
+    lse_safe = tl.where(final_lse > -1.0e4, final_lse, 0.0)
+    p = tl.exp(tl.where(p_gate, scores - lse_safe[:, None], -float("inf")))
 
     v_byte_dp = tl.load(v_byte_ptrs_dp, mask=d_mask[:, None] & kv_valid[None, :], other=0)
     v_nib_dp = tl.where(use_hi[:, None], v_byte_dp >> 4, v_byte_dp & 15)
@@ -1824,7 +1883,9 @@ def _sparse_attn_bwd_csr_nvfp4_kernel(
     v_scale_byte_dp = tl.load(v_scale + v_scale_offsets_dp, mask=d_mask[:, None] & kv_valid[None, :], other=0)
     v_dp = (_fp4_e2m1_to_f32(v_nib_dp) * _fp8_e4m3fn_to_f32(v_scale_byte_dp) * vg).to(tl.bfloat16)
     dp = tl.dot(do_tile, v_dp, out_dtype=tl.float32)
-    do_dot_o = tl.sum(do_tile * out_tile, axis=1)
+    # D must be fp32: bf16 products here bias ds = p*(dp - D) on every lane
+    # of converged rows (dp is fp32; the row-mode kernel already upcasts).
+    do_dot_o = tl.sum(do_tile.to(tl.float32) * out_tile.to(tl.float32), axis=1)
     ds = p * (dp - do_dot_o[:, None])
 
     k_byte_grad = tl.load(k_byte_ptrs_grad, mask=kv_valid[:, None] & d_mask[None, :], other=0)
@@ -2925,6 +2986,12 @@ def sparse_attention_csr_varlen_triton_autograd(
         raise NotImplementedError("SM120 Triton autograd backend currently supports BF16 Q/K/V only")
     if q.shape[-1] != 128:
         raise NotImplementedError("SM120 Triton autograd backend currently supports D=128 only")
+    # Kernels do raw pointer math over packed (total_q, head_q, dim); a
+    # strided view silently corrupts fwd AND bwd (the nvfp4/fp8 entries
+    # already normalize).
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
     if _forward_mode() == "qstat":
         # Q-stationary single-pass kernels: fastest when neighboring queries
         # select overlapping blocks (the realistic MSA regime); no atomics, so
@@ -3536,7 +3603,10 @@ def _sparse_decode_paged_fp8_kernel(
         scores = tl.sum(k_tile * q_vec[:, None], axis=0) * softmax_scale
         scores = tl.where(token_valid, scores, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(scores, axis=0))
-        alpha = tl.exp(m_i - m_new)
+        # exp(-inf - -inf) = NaN while no valid page has been seen (leading
+        # invalid slot); acc/l_i are still 0 then, so alpha=1 keeps them 0
+        # instead of permanently poisoning the row.
+        alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
         p = tl.exp(scores - m_new)
         p = tl.where(token_valid, p, 0.0)
         if quantize_p_fp8:
@@ -3629,7 +3699,10 @@ def _sparse_decode_paged_fp8_split_kernel(
         scores = tl.sum(k_tile * q_vec[:, None], axis=0) * softmax_scale
         scores = tl.where(token_valid, scores, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(scores, axis=0))
-        alpha = tl.exp(m_i - m_new)
+        # exp(-inf - -inf) = NaN while no valid page has been seen (leading
+        # invalid slot); acc/l_i are still 0 then, so alpha=1 keeps them 0
+        # instead of permanently poisoning the row.
+        alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
         p = tl.exp(scores - m_new)
         p = tl.where(token_valid, p, 0.0)
         if quantize_p_fp8:
@@ -3652,7 +3725,10 @@ def _sparse_decode_paged_fp8_split_kernel(
     )
     tl.store(
         lse_partial + (split_idx * total_q + q_idx) * head_q + q_head,
-        tl.where(has_value, tl.log(l_i) + m_i, -30000.0),  # finite empty-row sentinel
+        # Split-K PARTIALs keep -inf by design (the combiner gates on it and
+        # emits the finite sentinel itself); a -30000 partial would pass the
+        # combiner's `lse > -inf` gate as a real block.
+        tl.where(has_value, tl.log(l_i) + m_i, -float("inf")),
     )
 
 
