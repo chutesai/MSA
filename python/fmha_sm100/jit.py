@@ -11,6 +11,7 @@ To recompile after kernel changes: scripts/clear_fmha_cache.sh
 
 import itertools
 import fcntl
+import functools
 import logging
 import os
 import shutil
@@ -31,6 +32,27 @@ def _target_cuda_arch() -> str:
     arch = os.environ.get("FMHA_CUDA_ARCH", "100a").strip().lower()
     arch = arch.removeprefix("sm_").removeprefix("compute_")
     return arch or "100a"
+
+
+@functools.cache
+def _nvcc_supported_archs() -> frozenset[str] | None:
+    """compute_* targets the local nvcc accepts, or None if the probe fails.
+
+    The 100a target pairs a compute_103a gencode for SM103 (B300); toolkits
+    older than 12.9 abort with "Unsupported gpu architecture 'compute_103a'".
+    """
+    nvcc = shutil.which("nvcc") or os.path.join(
+        os.environ.get("CUDA_HOME", "/usr/local/cuda"), "bin", "nvcc"
+    )
+    try:
+        result = subprocess.run(
+            [nvcc, "--list-gpu-arch"], capture_output=True, text=True, timeout=30
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return frozenset(line.strip() for line in result.stdout.split() if line.strip())
 
 
 def _compute_cache_base():
@@ -218,10 +240,15 @@ def _get_nvcc_flags(cache_dir, fmha=True):
     cutlass_util_include = str(_CUTLASS_UTIL_INCLUDE)
     target_arch = _target_cuda_arch()
     if target_arch == "100a":
-        arch_flags = [
-            "-gencode=arch=compute_100a,code=sm_100a",
-            "-gencode=arch=compute_103a,code=sm_103a",
-        ]
+        arch_flags = ["-gencode=arch=compute_100a,code=sm_100a"]
+        supported = _nvcc_supported_archs()
+        if supported is None or "compute_103a" in supported:
+            arch_flags.append("-gencode=arch=compute_103a,code=sm_103a")
+        else:
+            logger.warning(
+                "nvcc does not support compute_103a (CUDA < 12.9); "
+                "building SM100-only fatbins without the SM103 target."
+            )
     else:
         arch_flags = [
             f"-gencode=arch=compute_{target_arch},code=sm_{target_arch}",
